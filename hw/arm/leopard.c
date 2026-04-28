@@ -26,6 +26,7 @@
 #include "hw/core/loader.h"
 #include "hw/core/sysbus.h"
 #include "hw/intc/arm_gic.h"
+#include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "system/address-spaces.h"
 #include "system/system.h"
@@ -247,21 +248,154 @@ static const MemoryRegionOps leopard_unmap_ops = {
     .valid.max_access_size = 4,
 };
 
-/* --- microsecond counter at TIMER_BASE+0x48 -----------------------------
- * U-Boot reads a free-running counter for udelay()/get_timer().  We expose
- * the host monotonic clock in microseconds at offset 0x48 and treat the rest
- * of the page as RAZ/WI.
+/* --- MTK General-Purpose Timer at 0x10004000 ----------------------------
+ * 6 channels, stride 0x10, channel N base = 0x10004010 + N*0x10:
+ *   +0x00 CON       bit0 = enable, bit1 = periodic mode
+ *   +0x04 COMPARE   match value (period); units = timer clock ticks
+ *   +0x0C CNT       current count
+ *   +0x1C PRESCALE  clock-source / prescaler (channel 5 only)
+ * Global registers at 0x10004000:
+ *   +0x00 IRQ_EN    bit N = enable IRQ from channel N
+ *   +0x04 IRQ_STA   bit N = pending
+ *   +0x08 IRQ_ACK   write 1<<N to clear channel N pending
+ * All channels OR'd to one IRQ line (GIC SPI 152). The RTOS uses channel
+ * 5 for the OS tick; U-Boot pre-RTOS reads a µs free-running counter
+ * which we synthesise at offset 0x48 (= channel 3 +0x08) regardless of
+ * channel-3 CON state, since U-Boot doesn't program the channel.
+ *
+ * Timer-period model: we treat COMPARE as microseconds (clock = 1 MHz),
+ * with a 1 ms floor so we never schedule absurdly fast and starve TCG.
+ * If CON enables a channel without a non-zero COMPARE, we default to
+ * 1 ms — enough to advance the RTOS tick into Ethernet bring-up.
  */
+#define LEOPARD_GPT_NCHAN  6
+#define LEOPARD_GPT_IRQ    152   /* GIC SPI; INTID = 32 + 152 = 184 (0xB8) */
+
+typedef struct {
+    uint32_t con;
+    uint32_t compare;
+    uint32_t cnt;
+    uint32_t prescale;
+    int      idx;
+    QEMUTimer *timer;
+    int64_t  start_ns;
+} LeopardGptChan;
+
+static struct {
+    uint32_t irq_en;
+    uint32_t irq_sta;
+    qemu_irq irq;
+    LeopardGptChan ch[LEOPARD_GPT_NCHAN];
+} gpt;
+
+static void gpt_update_irq(void)
+{
+    qemu_set_irq(gpt.irq, (gpt.irq_sta & gpt.irq_en) ? 1 : 0);
+}
+
+static int64_t gpt_period_ns(LeopardGptChan *c)
+{
+    int64_t us = c->compare ? c->compare : 1000;
+    if (us < 1000) us = 1000;          /* 1 ms floor */
+    return us * 1000;                  /* ns */
+}
+
+static void gpt_chan_cb(void *opaque)
+{
+    LeopardGptChan *c = opaque;
+    gpt.irq_sta |= (1u << c->idx);
+    gpt_update_irq();
+    if (c->con & 2) {                  /* periodic mode */
+        c->start_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        timer_mod(c->timer, c->start_ns + gpt_period_ns(c));
+    }
+}
+
+static void gpt_chan_rearm(LeopardGptChan *c)
+{
+    if (c->con & 3) {                  /* enable bit OR mode bit */
+        c->start_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        timer_mod(c->timer, c->start_ns + gpt_period_ns(c));
+    } else {
+        timer_del(c->timer);
+    }
+}
+
 static uint64_t leopard_timer_read(void *opaque, hwaddr off, unsigned size)
 {
+    /* Preserve U-Boot's expectation: free-running µs counter at +0x48. */
     if (off == 0x48) {
         return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1000;
+    }
+    /* Global regs */
+    if (off < 0x10) {
+        switch (off) {
+        case 0x00: return gpt.irq_en;
+        case 0x04: return gpt.irq_sta;
+        case 0x08: return 0;
+        }
+        return 0;
+    }
+    /* Per-channel */
+    if (off >= 0x10 && off < 0x10 + LEOPARD_GPT_NCHAN * 0x10) {
+        unsigned ch = (off - 0x10) >> 4;
+        unsigned reg = off & 0xf;
+        LeopardGptChan *c = &gpt.ch[ch];
+        switch (reg) {
+        case 0x0: return c->con;
+        case 0x4: return c->compare;
+        case 0xc: {
+            /* synthesise current count from elapsed time at 1 MHz */
+            if (!(c->con & 1)) return c->cnt;
+            int64_t dt = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - c->start_ns;
+            return (uint32_t)(dt / 1000);
+        }
+        }
+        return 0;
     }
     return 0;
 }
 
 static void leopard_timer_write(void *opaque, hwaddr off,
-                                uint64_t val, unsigned size) { }
+                                uint64_t val, unsigned size)
+{
+    if (off < 0x10) {
+        switch (off) {
+        case 0x00:
+            gpt.irq_en = val;
+            gpt_update_irq();
+            return;
+        case 0x04:
+            gpt.irq_sta = val;
+            gpt_update_irq();
+            return;
+        case 0x08:
+            gpt.irq_sta &= ~(uint32_t)val;
+            gpt_update_irq();
+            return;
+        }
+        return;
+    }
+    if (off >= 0x10 && off < 0x10 + LEOPARD_GPT_NCHAN * 0x10) {
+        unsigned ch = (off - 0x10) >> 4;
+        unsigned reg = off & 0xf;
+        LeopardGptChan *c = &gpt.ch[ch];
+        switch (reg) {
+        case 0x0: {
+            uint32_t old = c->con;
+            c->con = val;
+            if ((old & 3) != (val & 3)) {
+                gpt_chan_rearm(c);
+            }
+            return;
+        }
+        case 0x4: c->compare = val; return;
+        case 0xc: c->cnt = val; return;
+        }
+        if (reg == 0xc) c->cnt = val;
+        if (off == (0x10 + ch * 0x10) + 0x1c) c->prescale = val;
+    }
+}
 
 static const MemoryRegionOps leopard_timer_ops = {
     .read = leopard_timer_read,
@@ -270,6 +404,24 @@ static const MemoryRegionOps leopard_timer_ops = {
     .valid.min_access_size = 1,
     .valid.max_access_size = 4,
 };
+
+/* The RTOS keeps its OS tick in plain RAM at 0x407130f0 (a 64-bit
+ * counter) and bumps it from the CP15 arch-timer ISR. Some early-boot
+ * delay loops run with CPSR I-bit set, so the ISR never runs and the
+ * tick never advances — they hang forever. Bypass by writing the tick
+ * variable directly from a host-side periodic timer at the same rate
+ * the firmware expects (~CP15 counter rate, ~62.5 MHz). */
+#define LEOPARD_TICK64_ADDR  0x407130f0
+#define LEOPARD_TICK64_HZ    62500000ULL
+static QEMUTimer *leopard_tick_timer;
+static void leopard_tick_cb(void *opaque)
+{
+    int64_t ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    uint64_t v = (uint64_t)ns * LEOPARD_TICK64_HZ / 1000000000ULL;
+    address_space_write(&address_space_memory, LEOPARD_TICK64_ADDR,
+                        MEMTXATTRS_UNSPECIFIED, &v, sizeof(v));
+    timer_mod(leopard_tick_timer, ns + 1000000); /* 1 ms */
+}
 
 /* Periodic I/O kick: the RTOS polls UART LSR in a tight loop which can
  * starve QEMU's main-loop I/O processing on TCG.  This timer fires
@@ -300,6 +452,7 @@ static void leopard_init(MachineState *machine)
     ARMCPU *cpus[2];
     MemoryRegion *dram = g_new(MemoryRegion, 1);
     MemoryRegion *timer = g_new(MemoryRegion, 1);
+    DeviceState *gic = NULL;
     int num_cpus = machine->smp.cpus;
     int n;
 
@@ -321,7 +474,7 @@ static void leopard_init(MachineState *machine)
 
     /* GICv2: distributor at 0x10310000, CPU interface at 0x10320000 */
     {
-        DeviceState *gic = qdev_new(TYPE_ARM_GIC);
+        gic = qdev_new(TYPE_ARM_GIC);
         SysBusDevice *gicbus = SYS_BUS_DEVICE(gic);
         /* PPI numbers (offset within the 16 PPI slots, INTID = 16 + ppi) */
         const int timer_ppi[] = {
@@ -330,7 +483,7 @@ static void leopard_init(MachineState *machine)
             [GTIMER_HYP]  = 10,  /* INTID 26 */
             [GTIMER_SEC]  = 13,  /* INTID 29 */
         };
-        int num_spi = 128;
+        int num_spi = 192;   /* must cover GPT SPI 152 */
         int i;
 
         qdev_prop_set_uint32(gic, "num-irq", num_spi + GIC_INTERNAL);
@@ -420,11 +573,20 @@ static void leopard_init(MachineState *machine)
         memory_region_add_subregion(sysmem, 0x1b000000, mr);
     }
 
-    /* Free-running us counter (overlays sysctrl-lo at 0x10004000) */
+    /* MTK GPT (overlays sysctrl-lo at 0x10004000). Six channels, one
+     * shared IRQ on GIC SPI 152. */
     memory_region_init_io(timer, NULL, &leopard_timer_ops, NULL,
                           "leopard.timer", LEOPARD_TIMER_SIZE);
     memory_region_add_subregion_overlap(sysmem, LEOPARD_TIMER_BASE,
                                         timer, 1);
+    for (n = 0; n < LEOPARD_GPT_NCHAN; n++) {
+        gpt.ch[n].idx = n;
+        gpt.ch[n].timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                       gpt_chan_cb, &gpt.ch[n]);
+    }
+    if (gic) {
+        gpt.irq = qdev_get_gpio_in(gic, LEOPARD_GPT_IRQ);
+    }
 
     /* 16550 UART — must overlay the periph-ram with higher priority */
     {
@@ -436,6 +598,17 @@ static void leopard_init(MachineState *machine)
         qdev_prop_set_uint8(dev, "endianness", DEVICE_LITTLE_ENDIAN);
         sysbus_realize_and_unref(sbd, &error_fatal);
         sysbus_mmio_map_overlap(sbd, 0, LEOPARD_UART_BASE, 2);
+        /* Wire UART0 IRQ to GIC SPI. SPI number is configurable via env
+         * (LEOPARD_UART_IRQ) since we don't yet know the firmware's wiring;
+         * default to SPI 51, a common MT76xx UART0 IRQ. */
+        if (gic) {
+            const char *env = getenv("LEOPARD_UART_IRQ");
+            if (env) {
+                int spi = (int)strtol(env, NULL, 0);
+                sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(gic, spi));
+                fprintf(stderr, "[leopard] UART0 IRQ -> GIC SPI %d\n", spi);
+            }
+        }
     }
 
     /* Image loading:
@@ -474,6 +647,12 @@ static void leopard_init(MachineState *machine)
     }
 
     qemu_register_reset(leopard_cpu_reset, cpus[0]);
+
+    /* Bump RTOS tick64 in DRAM via host timer (bypasses CPU IRQ-mask). */
+    leopard_tick_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                      leopard_tick_cb, NULL);
+    timer_mod(leopard_tick_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000);
 
     /* Start periodic I/O kick timer */
     leopard_io_kick_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
