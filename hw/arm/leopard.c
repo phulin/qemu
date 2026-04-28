@@ -405,6 +405,62 @@ static const MemoryRegionOps leopard_timer_ops = {
     .valid.max_access_size = 4,
 };
 
+/* MTK GSW MDIO controller (PHY_IAC) — single 32-bit register at
+ * 0x1B110000 + 0x04. Layout (clause-22):
+ *   bit31     START/BUSY  (sw=1 to start; hw clears on completion)
+ *   bits29:25 PHY address
+ *   bits24:20 Register address
+ *   bits19:18 OP (01=write, 10=read c22, 11=c45 addr, 01-after=c45 read)
+ *   bits15:0  DATA
+ * Stub: complete writes immediately (clear bit31), return 0xFFFF on
+ * reads (= no PHY), and log every transaction so we can identify what
+ * PHY ID(s) the firmware probes for. */
+#define MDIO_BASE      0x1B110000
+#define MDIO_REG       0x04
+static struct {
+    uint32_t cmd;
+    uint16_t last_data;
+    int      log_n;
+} mdio;
+
+static uint64_t mdio_read(void *opaque, hwaddr off, unsigned size)
+{
+    if (off == MDIO_REG) {
+        return (mdio.cmd & ~0x8000FFFFu) | mdio.last_data;
+    }
+    return 0;
+}
+static void mdio_write(void *opaque, hwaddr off,
+                       uint64_t val, unsigned size)
+{
+    if (off != MDIO_REG) return;
+    uint32_t v = val;
+    mdio.cmd = v & ~0x80000000u;       /* clear BUSY immediately */
+    if (v & 0x80000000u) {
+        unsigned op  = (v >> 18) & 3;
+        unsigned phy = (v >> 25) & 0x1f;
+        unsigned reg = (v >> 20) & 0x1f;
+        unsigned data = v & 0xffff;
+        if (op == 2 || op == 3) {
+            mdio.last_data = 0xffff;   /* no PHY responds */
+        } else {
+            mdio.last_data = data;
+        }
+        if (mdio.log_n < 64) {
+            mdio.log_n++;
+            fprintf(stderr, "[mdio] op=%u phy=%u reg=%u data=%#x\n",
+                    op, phy, reg, data);
+        }
+    }
+}
+static const MemoryRegionOps mdio_ops = {
+    .read = mdio_read,
+    .write = mdio_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid.min_access_size = 4,
+    .valid.max_access_size = 4,
+};
+
 /* The RTOS keeps its OS tick in plain RAM at 0x407130f0 (a 64-bit
  * counter) and bumps it from the CP15 arch-timer ISR. Some early-boot
  * delay loops run with CPSR I-bit set, so the ISR never runs and the
@@ -542,6 +598,14 @@ static void leopard_init(MachineState *machine)
         memory_region_init_ram(mr, NULL, "leopard.periph-ram",
                                0x10000000, &error_fatal);
         memory_region_add_subregion(sysmem, 0x10000000, mr);
+    }
+
+    /* MTK GSW MDIO controller stub at 0x1B110000 */
+    {
+        MemoryRegion *mr = g_new(MemoryRegion, 1);
+        memory_region_init_io(mr, NULL, &mdio_ops, NULL,
+                              "leopard.mdio", 0x1000);
+        memory_region_add_subregion_overlap(sysmem, MDIO_BASE, mr, 1);
     }
 
     /* NOR controller overlay at 0x11014000 with priority 1 */
