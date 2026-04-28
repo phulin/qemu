@@ -647,6 +647,12 @@ static ssize_t leopard_fe_receive(NetClientState *nc,
                                   const uint8_t *buf, size_t size)
 {
     LeopardFEState *s = qemu_get_nic_opaque(nc);
+    static int rx_log = 0;
+    if (rx_log++ < 8) {
+        fprintf(stderr, "[fe] RX size=%zu glo=%#x base=%#x max=%u drx=%u crx=%u\n",
+                size, s->glo_cfg, s->rx_base, s->rx_max,
+                s->rx_drx_idx, s->rx_crx_idx);
+    }
     if (!(s->glo_cfg & 4)) return 0;
     if (!s->rx_base || !s->rx_max) return 0;
     if (size > 1600) return size;        /* drop oversize */
