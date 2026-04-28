@@ -36,6 +36,13 @@ config ARM_VIRT
     select ACPI_CXL
     select ACPI_HMAT
 
+config LEOPARD
+    bool
+    default y
+    depends on TCG && ARM
+    select SERIAL_MM
+    select ARM_GIC
+
 config CUBIEBOARD
     bool
     default y
