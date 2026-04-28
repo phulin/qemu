@@ -36,6 +36,9 @@
 #include "chardev/char.h"
 #include "chardev/char-fe.h"
 #include "target/arm/gtimer.h"
+#include "net/net.h"
+#include "system/dma.h"
+#include "qom/object.h"
 
 #define LEOPARD_DRAM_BASE   0x40000000
 #define LEOPARD_DRAM_SIZE   (256 * MiB)
@@ -492,6 +495,321 @@ static void leopard_io_kick_cb(void *opaque)
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100000); /* 0.1ms */
 }
 
+/* ----------------------------------------------------------------------
+ * MediaTek MT7626 Frame Engine / PDMA — minimal model
+ *
+ * Just enough to let firmware bring up the RX/TX rings and exchange
+ * frames with QEMU's host network (slirp / -netdev user). Implements
+ * the registers documented in the project notes; descriptors follow
+ * the MTK PDMA layout (4x32-bit words per descriptor, stride 0x10).
+ * --------------------------------------------------------------------*/
+#define LEOPARD_FE_BASE        0x1B100000
+#define LEOPARD_FE_SIZE        0x1000
+#define LEOPARD_FE_IRQ         199
+
+#define FE_GDMA1_FWD_CFG       0x500
+#define FE_GMAC1_MAC_ADRH      0x508
+#define FE_GMAC1_MAC_ADRL      0x50C
+#define FE_PDMA_RX0_BASE_PTR   0x800
+#define FE_PDMA_RX0_MAX_CNT    0x804
+#define FE_PDMA_RX0_CRX_IDX    0x808
+#define FE_PDMA_TX0_BASE_PTR   0x900
+#define FE_PDMA_TX0_MAX_CNT    0x904
+#define FE_PDMA_TX0_CTX_IDX    0x908
+#define FE_PDMA_GLO_CFG        0xA04
+#define FE_PDMA_RST_IDX        0xA08
+#define FE_PDMA_DLY_INT_CFG    0xA0C
+#define FE_PDMA_INT_STATUS     0xA20
+#define FE_PDMA_INT_MASK       0xA28
+
+#define FE_INT_RX_DONE_INT0    (1u << 30)
+
+#define TYPE_LEOPARD_FE        "leopard-fe"
+typedef struct LeopardFEState LeopardFEState;
+DECLARE_INSTANCE_CHECKER(LeopardFEState, LEOPARD_FE, TYPE_LEOPARD_FE)
+
+struct LeopardFEState {
+    SysBusDevice parent_obj;
+    MemoryRegion iomem;
+    qemu_irq     irq;
+    NICState    *nic;
+    NICConf      conf;
+
+    uint32_t gdma1_fwd_cfg;
+    uint32_t mac_h;
+    uint32_t mac_l;
+
+    uint32_t rx_base;
+    uint32_t rx_max;
+    uint32_t rx_crx_idx;
+    uint32_t rx_drx_idx;       /* HW producer for RX */
+
+    uint32_t tx_base;
+    uint32_t tx_max;
+    uint32_t tx_ctx_idx;
+    uint32_t tx_dtx_idx;       /* HW consumer for TX */
+
+    uint32_t glo_cfg;
+    uint32_t dly_int_cfg;
+    uint32_t int_mask;
+    uint32_t int_status;
+
+    bool     enabled_logged;
+};
+
+static void leopard_fe_update_irq(LeopardFEState *s)
+{
+    qemu_set_irq(s->irq, (s->int_status & s->int_mask) ? 1 : 0);
+}
+
+static hwaddr leopard_fe_dma_addr(uint32_t reg)
+{
+    /* Firmware writes (phys & 0x1fffffff) | 0x40000000. Strip flag bits
+     * and OR back DRAM base. */
+    return ((hwaddr)(reg & 0x1fffffffu)) | LEOPARD_DRAM_BASE;
+}
+
+/* Read a 16-byte PDMA descriptor (4 LE words). */
+static void leopard_fe_read_desc(hwaddr base, unsigned idx, uint32_t d[4])
+{
+    hwaddr a = base + (hwaddr)idx * 0x10;
+    for (int i = 0; i < 4; i++) {
+        uint32_t w = 0;
+        address_space_read(&address_space_memory, a + i * 4,
+                           MEMTXATTRS_UNSPECIFIED, &w, 4);
+        d[i] = le32_to_cpu(w);
+    }
+}
+
+static void leopard_fe_write_desc(hwaddr base, unsigned idx, const uint32_t d[4])
+{
+    hwaddr a = base + (hwaddr)idx * 0x10;
+    for (int i = 0; i < 4; i++) {
+        uint32_t w = cpu_to_le32(d[i]);
+        address_space_write(&address_space_memory, a + i * 4,
+                            MEMTXATTRS_UNSPECIFIED, &w, 4);
+    }
+}
+
+/* Flush any pending TX descriptors from dtx_idx up to ctx_idx. */
+static void leopard_fe_kick_tx(LeopardFEState *s)
+{
+    if (!s->tx_base || !s->tx_max) return;
+    if (!(s->glo_cfg & 1)) return;       /* TX_DMA_EN bit0 */
+
+    hwaddr base = leopard_fe_dma_addr(s->tx_base);
+    uint32_t max = s->tx_max;
+    while (s->tx_dtx_idx != s->tx_ctx_idx) {
+        uint32_t d[4];
+        leopard_fe_read_desc(base, s->tx_dtx_idx, d);
+        uint32_t buf_phys = d[0];
+        uint32_t ctrl     = d[1];
+        /* MTK PDMA TX: bit31 of DMAD1 is DDONE — for TX, HW sets it after
+         * sending; SW posts with it cleared. Just go ahead and send. */
+        uint32_t len = ctrl & 0x3fff;
+        if (len && len <= 1600) {
+            uint8_t buf[1600];
+            hwaddr ba = leopard_fe_dma_addr(buf_phys);
+            address_space_read(&address_space_memory, ba,
+                               MEMTXATTRS_UNSPECIFIED, buf, len);
+            fprintf(stderr, "[fe] TX len=%u idx=%u buf=%#" PRIx64
+                    " %02x:%02x:%02x:%02x:%02x:%02x -> "
+                    "%02x:%02x:%02x:%02x:%02x:%02x type=%02x%02x\n",
+                    len, s->tx_dtx_idx, ba,
+                    buf[0], buf[1], buf[2], buf[3], buf[4], buf[5],
+                    buf[6], buf[7], buf[8], buf[9], buf[10], buf[11],
+                    buf[12], buf[13]);
+            if (s->nic) {
+                qemu_send_packet(qemu_get_queue(s->nic), buf, len);
+            }
+        } else {
+            fprintf(stderr, "[fe] TX skip idx=%u len=%u\n",
+                    s->tx_dtx_idx, len);
+        }
+        /* Mark DDONE = 1 (HW done with this desc) */
+        d[1] = ctrl | 0x80000000u;
+        leopard_fe_write_desc(base, s->tx_dtx_idx, d);
+        s->tx_dtx_idx = (s->tx_dtx_idx + 1) % max;
+    }
+}
+
+static bool leopard_fe_can_receive(NetClientState *nc)
+{
+    LeopardFEState *s = qemu_get_nic_opaque(nc);
+    if (!(s->glo_cfg & 4)) return false;     /* RX_DMA_EN bit2 */
+    if (!s->rx_base || !s->rx_max) return false;
+    /* Have at least one HW-owned descriptor? */
+    uint32_t next = (s->rx_drx_idx + 1) % s->rx_max;
+    return next != s->rx_crx_idx;
+}
+
+static ssize_t leopard_fe_receive(NetClientState *nc,
+                                  const uint8_t *buf, size_t size)
+{
+    LeopardFEState *s = qemu_get_nic_opaque(nc);
+    if (!(s->glo_cfg & 4)) return 0;
+    if (!s->rx_base || !s->rx_max) return 0;
+    if (size > 1600) return size;        /* drop oversize */
+
+    hwaddr base = leopard_fe_dma_addr(s->rx_base);
+    uint32_t idx = s->rx_drx_idx;
+    uint32_t d[4];
+    leopard_fe_read_desc(base, idx, d);
+    if (d[1] & 0x80000000u) {
+        /* HW already wrote here, software hasn't consumed; drop. */
+        return 0;
+    }
+    hwaddr ba = leopard_fe_dma_addr(d[0]);
+    address_space_write(&address_space_memory, ba,
+                        MEMTXATTRS_UNSPECIFIED, buf, size);
+    /* DDONE=1, length in lower 14 bits */
+    d[1] = 0x80000000u | (uint32_t)(size & 0x3fff);
+    leopard_fe_write_desc(base, idx, d);
+    s->rx_drx_idx = (idx + 1) % s->rx_max;
+
+    s->int_status |= FE_INT_RX_DONE_INT0;
+    leopard_fe_update_irq(s);
+    return size;
+}
+
+static uint64_t leopard_fe_read(void *opaque, hwaddr off, unsigned size)
+{
+    LeopardFEState *s = opaque;
+    switch (off) {
+    case FE_GDMA1_FWD_CFG:    return s->gdma1_fwd_cfg;
+    case FE_GMAC1_MAC_ADRH:   return s->mac_h;
+    case FE_GMAC1_MAC_ADRL:   return s->mac_l;
+    case FE_PDMA_RX0_BASE_PTR:return s->rx_base;
+    case FE_PDMA_RX0_MAX_CNT: return s->rx_max;
+    case FE_PDMA_RX0_CRX_IDX: return s->rx_crx_idx;
+    case FE_PDMA_TX0_BASE_PTR:return s->tx_base;
+    case FE_PDMA_TX0_MAX_CNT: return s->tx_max;
+    case FE_PDMA_TX0_CTX_IDX: return s->tx_ctx_idx;
+    case FE_PDMA_GLO_CFG:
+        /* Always report TX/RX_DMA_BUSY clear (bits 1 and 3). */
+        return s->glo_cfg & ~0x0Au;
+    case FE_PDMA_RST_IDX:     return 0;
+    case FE_PDMA_DLY_INT_CFG: return s->dly_int_cfg;
+    case FE_PDMA_INT_STATUS:  return s->int_status;
+    case FE_PDMA_INT_MASK:    return s->int_mask;
+    default:                  return 0;
+    }
+}
+
+static void leopard_fe_write(void *opaque, hwaddr off,
+                             uint64_t val, unsigned size)
+{
+    LeopardFEState *s = opaque;
+    switch (off) {
+    case FE_GDMA1_FWD_CFG: s->gdma1_fwd_cfg = val; break;
+    case FE_GMAC1_MAC_ADRH: s->mac_h = val; break;
+    case FE_GMAC1_MAC_ADRL: s->mac_l = val; break;
+    case FE_PDMA_RX0_BASE_PTR: s->rx_base = val; break;
+    case FE_PDMA_RX0_MAX_CNT:  s->rx_max = val; break;
+    case FE_PDMA_RX0_CRX_IDX:
+        s->rx_crx_idx = val;
+        /* Driver consumed up to here — wake any pending receivers. */
+        if (s->nic) {
+            qemu_flush_queued_packets(qemu_get_queue(s->nic));
+        }
+        break;
+    case FE_PDMA_TX0_BASE_PTR: s->tx_base = val; break;
+    case FE_PDMA_TX0_MAX_CNT:  s->tx_max = val; break;
+    case FE_PDMA_TX0_CTX_IDX:
+        s->tx_ctx_idx = val;
+        leopard_fe_kick_tx(s);
+        break;
+    case FE_PDMA_GLO_CFG: {
+        uint32_t old = s->glo_cfg;
+        s->glo_cfg = val;
+        if ((val & 5) && !s->enabled_logged) {
+            fprintf(stderr, "[fe] PDMA enabled, GLO_CFG=%#x (was %#x) "
+                    "rx_base=%#x rx_max=%u tx_base=%#x tx_max=%u\n",
+                    (unsigned)val, (unsigned)old,
+                    s->rx_base, s->rx_max, s->tx_base, s->tx_max);
+            s->enabled_logged = true;
+        }
+        if (val & 1) leopard_fe_kick_tx(s);
+        if ((val & 4) && s->nic) {
+            qemu_flush_queued_packets(qemu_get_queue(s->nic));
+        }
+        break;
+    }
+    case FE_PDMA_RST_IDX:
+        /* Treat as sticky=0: reset both index counters when bits set. */
+        if (val & 1) { s->tx_ctx_idx = 0; s->tx_dtx_idx = 0; }
+        if (val & (1u << 16)) { s->rx_crx_idx = 0; s->rx_drx_idx = 0; }
+        break;
+    case FE_PDMA_DLY_INT_CFG: s->dly_int_cfg = val; break;
+    case FE_PDMA_INT_STATUS:
+        s->int_status &= ~(uint32_t)val;       /* W1C */
+        leopard_fe_update_irq(s);
+        break;
+    case FE_PDMA_INT_MASK:
+        s->int_mask = val;
+        leopard_fe_update_irq(s);
+        break;
+    default: break;
+    }
+}
+
+static const MemoryRegionOps leopard_fe_ops = {
+    .read = leopard_fe_read,
+    .write = leopard_fe_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid.min_access_size = 4,
+    .valid.max_access_size = 4,
+};
+
+static NetClientInfo leopard_fe_net_info = {
+    .type = NET_CLIENT_DRIVER_NIC,
+    .size = sizeof(NICState),
+    .can_receive = leopard_fe_can_receive,
+    .receive = leopard_fe_receive,
+};
+
+static void leopard_fe_realize(DeviceState *dev, Error **errp)
+{
+    LeopardFEState *s = LEOPARD_FE(dev);
+    SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+
+    memory_region_init_io(&s->iomem, OBJECT(s), &leopard_fe_ops, s,
+                          TYPE_LEOPARD_FE, LEOPARD_FE_SIZE);
+    sysbus_init_mmio(sbd, &s->iomem);
+    sysbus_init_irq(sbd, &s->irq);
+
+    qemu_macaddr_default_if_unset(&s->conf.macaddr);
+    s->nic = qemu_new_nic(&leopard_fe_net_info, &s->conf,
+                          object_get_typename(OBJECT(dev)), dev->id,
+                          &dev->mem_reentrancy_guard, s);
+    qemu_format_nic_info_str(qemu_get_queue(s->nic), s->conf.macaddr.a);
+}
+
+static const Property leopard_fe_properties[] = {
+    DEFINE_NIC_PROPERTIES(LeopardFEState, conf),
+};
+
+static void leopard_fe_class_init(ObjectClass *klass, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    dc->realize = leopard_fe_realize;
+    device_class_set_props(dc, leopard_fe_properties);
+    set_bit(DEVICE_CATEGORY_NETWORK, dc->categories);
+}
+
+static const TypeInfo leopard_fe_type_info = {
+    .name = TYPE_LEOPARD_FE,
+    .parent = TYPE_SYS_BUS_DEVICE,
+    .instance_size = sizeof(LeopardFEState),
+    .class_init = leopard_fe_class_init,
+};
+
+static void leopard_fe_register_types(void)
+{
+    type_register_static(&leopard_fe_type_info);
+}
+type_init(leopard_fe_register_types)
+
 static struct arm_boot_info leopard_binfo;
 static hwaddr leopard_reset_pc;
 
@@ -539,7 +857,7 @@ static void leopard_init(MachineState *machine)
             [GTIMER_HYP]  = 10,  /* INTID 26 */
             [GTIMER_SEC]  = 13,  /* INTID 29 */
         };
-        int num_spi = 192;   /* must cover GPT SPI 152 */
+        int num_spi = 256;   /* must cover GPT SPI 152, FE SPI 199 */
         int i;
 
         qdev_prop_set_uint32(gic, "num-irq", num_spi + GIC_INTERNAL);
@@ -672,6 +990,22 @@ static void leopard_init(MachineState *machine)
                 sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(gic, spi));
                 fprintf(stderr, "[leopard] UART0 IRQ -> GIC SPI %d\n", spi);
             }
+        }
+    }
+
+    /* MTK Frame Engine / PDMA at 0x1B100000 — NIC connected to user-net. */
+    {
+        DeviceState *dev = qdev_new(TYPE_LEOPARD_FE);
+        SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+        NICInfo *nd = qemu_find_nic_info(TYPE_LEOPARD_FE, true, NULL);
+        if (nd) {
+            qdev_set_nic_properties(dev, nd);
+        }
+        sysbus_realize_and_unref(sbd, &error_fatal);
+        sysbus_mmio_map_overlap(sbd, 0, LEOPARD_FE_BASE, 2);
+        if (gic) {
+            sysbus_connect_irq(sbd, 0,
+                               qdev_get_gpio_in(gic, LEOPARD_FE_IRQ));
         }
     }
 
