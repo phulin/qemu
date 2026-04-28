@@ -505,7 +505,7 @@ static void leopard_io_kick_cb(void *opaque)
  * --------------------------------------------------------------------*/
 #define LEOPARD_FE_BASE        0x1B100000
 #define LEOPARD_FE_SIZE        0x1000
-#define LEOPARD_FE_IRQ         199
+#define LEOPARD_FE_IRQ         223  /* firmware passes INTID 0xff = SPI 223 */
 
 #define FE_GDMA1_FWD_CFG       0x500
 #define FE_GMAC1_MAC_ADRH      0x508
