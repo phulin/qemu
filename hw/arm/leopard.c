@@ -415,16 +415,115 @@ static const MemoryRegionOps leopard_timer_ops = {
  *   bits24:20 Register address
  *   bits19:18 OP (01=write, 10=read c22, 11=c45 addr, 01-after=c45 read)
  *   bits15:0  DATA
- * Stub: complete writes immediately (clear bit31), return 0xFFFF on
- * reads (= no PHY), and log every transaction so we can identify what
- * PHY ID(s) the firmware probes for. */
+ *
+ * We synthesize a fake "always link-up, 1000-FD, autoneg complete"
+ * gigabit PHY on every PHY address the firmware probes.  This gets the
+ * MTK switch driver past PHY-detect and into FE-RX-ring init so packets
+ * actually land in firmware buffers.
+ *
+ * Logging goes to a separate file (LEOPARD_MDIO_LOG env or
+ * /tmp/leopard_mdio.log) so we can study which addresses / regs are
+ * probed without flooding the main device log. */
 #define MDIO_BASE      0x1B110000
 #define MDIO_REG       0x04
+
+/* The firmware drives the MT-style indirect register access protocol on
+ * top of MDIO: PHY addresses 21/23/24/25/31 with reg 29 act as latched
+ * command channels into a 32-bit-addressable switch register file,
+ * rather than as ordinary PHY clause-22 reads.  Channels (empirically):
+ *   phy=31 reg=29  -> latch indirect "page" (high 16 bits of address)
+ *   phy=23 reg=29  -> latch indirect "addr" (low 16 bits of address)
+ *   phy=24 reg=29  -> latch indirect write data (low 16 bits)
+ *   phy=21 reg=29  -> command trigger
+ *                       0x0001 = read (page,addr) into result latch
+ *                       0x0003 = write (latched data) to (page,addr)
+ *   phy=25 reg=29  -> read latched result
+ *
+ * We back this with a sparse 32-bit register file (sw_reg) so reads
+ * return whatever was previously written.  For "fresh" reads we synth-
+ * esize plausible MT7531 values: chip-ID-like high word, link-up port
+ * status, etc.  Standard clause-22 PHY accesses on PHY addrs 0..4
+ * (the per-port internal PHYs) still work via phy_reg[]. */
+#define SW_REG_MAX 4096
 static struct {
     uint32_t cmd;
     uint16_t last_data;
     int      log_n;
+    FILE    *log_f;
+    /* Per-PHY scratch for register writes the driver might read back. */
+    uint16_t phy_reg[32][32];   /* [addr][reg] */
+    int      phy_init;
+    /* Indirect-access state */
+    uint16_t ind_page, ind_addr, ind_wdata;
+    uint16_t ind_result;
+    /* Sparse switch register file: linear search small table. */
+    struct { uint32_t key; uint16_t val; uint8_t used; } sw_reg[SW_REG_MAX];
+    int sw_reg_n;
 } mdio;
+
+static uint16_t *sw_reg_slot(uint32_t key, int create)
+{
+    for (int i = 0; i < mdio.sw_reg_n; i++) {
+        if (mdio.sw_reg[i].used && mdio.sw_reg[i].key == key) {
+            return &mdio.sw_reg[i].val;
+        }
+    }
+    if (!create || mdio.sw_reg_n >= SW_REG_MAX) return NULL;
+    mdio.sw_reg[mdio.sw_reg_n].key = key;
+    mdio.sw_reg[mdio.sw_reg_n].val = 0;
+    mdio.sw_reg[mdio.sw_reg_n].used = 1;
+    return &mdio.sw_reg[mdio.sw_reg_n++].val;
+}
+
+/* Synthesize a plausible MT7531-class read value for an unwritten
+ * 16-bit-wide indirect register at (page,addr).  These are the values
+ * the firmware needs to see early in switch bring-up:
+ *   page=0xe, addr=0x1300/0x1301 : GPHY alive marker (must be non-zero)
+ *   page=0,   addr=0x781C        : MT7531 chip ID low half  (CREV)
+ *   page=0,   addr=0x781E        : MT7531 chip ID high half (= 0x7531)
+ *   page=0,   addr=0x3008+P*0x100: PMSR_Pn — port-N MAC status, link
+ *                                  up / 1Gb / FD on every port
+ *   default                      : 0x0000
+ */
+static uint16_t sw_reg_default(uint32_t key)
+{
+    uint16_t page = key >> 16;
+    uint16_t addr = key & 0xffff;
+    if (page == 0xe) {
+        /* MTK GePHY top-block ID (from firmware MOVW probes — see
+         *  0x4023ee40, 0x40356150, 0x403a846c, etc. in decompressed.bin
+         *  where 0x03A2 is hardcoded). Try high-first ordering. */
+        if (addr == 0x1300) return 0x03a2;   /* high half of GePHY ID */
+        if (addr == 0x1301) return 0x29c2;   /* low  half of GePHY ID */
+    }
+    if (page == 0) {
+        if (addr == 0x781c) return 0x0000;     /* chip rev, low half */
+        if (addr == 0x781e) return 0x7531;     /* chip name, high half */
+        /* PMSR_Pn at 0x3008 | (P<<8). Bits: link(0), duplex(1), speed[5:4]=10 */
+        if ((addr & 0xf8ff) == 0x3008) return 0x0033;
+    }
+    return 0x0000;
+}
+
+static void mdio_init_phy(unsigned phy)
+{
+    /* Plausible Marvell-style PHY ID (88E1310-ish) on every address. */
+    mdio.phy_reg[phy][0]  = 0x1140;   /* BMCR: AN_ENABLE | DUPLEX | SPEED1000 */
+    mdio.phy_reg[phy][1]  = 0x796d;   /* BMSR: 100/10 cap | EXT_STATUS | AN_COMPLETE
+                                         | AN_ABILITY | LINK_UP | EXT_REGS */
+    mdio.phy_reg[phy][2]  = 0x0141;   /* PHYID1 = OUI Marvell */
+    mdio.phy_reg[phy][3]  = 0x0e70;   /* PHYID2 = 88E1310 model */
+    mdio.phy_reg[phy][4]  = 0x05e1;   /* ANAR: 100FD/100HD/10FD/10HD + 802.3 */
+    mdio.phy_reg[phy][5]  = 0x45e1;   /* ANLPAR: link partner same + ack */
+    mdio.phy_reg[phy][6]  = 0x000f;   /* ANER: page-rx + lp-an-able + lp-np */
+    mdio.phy_reg[phy][9]  = 0x0200;   /* GBCR: advertise 1000FD */
+    mdio.phy_reg[phy][10] = 0x7800;   /* GBSR: lp-1000FD | local-rx-ok |
+                                         remote-rx-ok | local-cfg-master */
+    mdio.phy_reg[phy][15] = 0x3000;   /* EXSR: 1000FD/1000HD capable */
+    /* Gen-purpose status (Marvell 88E1xxx PHY-specific register 17):
+     *   bit 11 = link real-time, bit 10 = duplex, bits 14:8 speed code 010=1Gb */
+    mdio.phy_reg[phy][17] = 0xac00;   /* speed=1Gb | duplex-FD | link-up | resolved */
+}
 
 static uint64_t mdio_read(void *opaque, hwaddr off, unsigned size)
 {
@@ -437,6 +536,13 @@ static void mdio_write(void *opaque, hwaddr off,
                        uint64_t val, unsigned size)
 {
     if (off != MDIO_REG) return;
+    if (!mdio.phy_init) {
+        const char *p = getenv("LEOPARD_MDIO_LOG");
+        if (!p) p = "/tmp/leopard_mdio.log";
+        mdio.log_f = fopen(p, "w");
+        for (unsigned a = 0; a < 32; a++) mdio_init_phy(a);
+        mdio.phy_init = 1;
+    }
     uint32_t v = val;
     mdio.cmd = v & ~0x80000000u;       /* clear BUSY immediately */
     if (v & 0x80000000u) {
@@ -444,15 +550,71 @@ static void mdio_write(void *opaque, hwaddr off,
         unsigned phy = (v >> 25) & 0x1f;
         unsigned reg = (v >> 20) & 0x1f;
         unsigned data = v & 0xffff;
-        if (op == 2 || op == 3) {
-            mdio.last_data = 0xffff;   /* no PHY responds */
-        } else {
+        const char *opname = "?";
+        const char *note = "";
+        /* Indirect-access channel: reg=29 on PHY addrs 21/23/24/25/31. */
+        if (reg == 29 && (phy == 21 || phy == 23 || phy == 24 ||
+                          phy == 25 || phy == 31)) {
+            if (op == 1) {              /* write */
+                opname = "wr";
+                if (phy == 31) { mdio.ind_page  = data; note = "page"; }
+                else if (phy == 23) { mdio.ind_addr  = data; note = "addr"; }
+                else if (phy == 24) { mdio.ind_wdata = data; note = "wdat"; }
+                else if (phy == 21) {
+                    note = "trig";
+                    uint32_t key = ((uint32_t)mdio.ind_page << 16)
+                                 | mdio.ind_addr;
+                    if (data == 0x0003) {
+                        uint16_t *s = sw_reg_slot(key, 1);
+                        if (s) *s = mdio.ind_wdata;
+                        note = "trig-WR";
+                    } else if (data == 0x0001) {
+                        uint16_t *s = sw_reg_slot(key, 0);
+                        mdio.ind_result = s ? *s : sw_reg_default(key);
+                        note = "trig-RD";
+                    }
+                }
+                mdio.last_data = data;
+            } else if (op == 2) {       /* read */
+                opname = "rd";
+                if (phy == 25) {
+                    mdio.last_data = mdio.ind_result;
+                    note = "result";
+                } else {
+                    /* read-back of latched fields */
+                    if      (phy == 31) mdio.last_data = mdio.ind_page;
+                    else if (phy == 23) mdio.last_data = mdio.ind_addr;
+                    else if (phy == 24) mdio.last_data = mdio.ind_wdata;
+                    else                mdio.last_data = 0;
+                }
+            } else {
+                opname = (op == 0) ? "c45a" : "c45r";
+                mdio.last_data = (op == 0) ? data : 0xffff;
+            }
+        } else if (op == 1) {           /* standard C22 write */
+            mdio.phy_reg[phy][reg] = data;
             mdio.last_data = data;
+            opname = "wr";
+        } else if (op == 2) {           /* standard C22 read */
+            mdio.last_data = mdio.phy_reg[phy][reg];
+            opname = "rd";
+        } else {                        /* C45 addr/read — stub */
+            mdio.last_data = (op == 0) ? data : 0xffff;
+            opname = (op == 0) ? "c45a" : "c45r";
+        }
+        if (mdio.log_f) {
+            fprintf(mdio.log_f,
+                    "[mdio] %-4s phy=%2u reg=%2u data=%#06x -> %#06x"
+                    "  %s%s%s [pg=%#x ad=%#x]\n",
+                    opname, phy, reg, data, mdio.last_data,
+                    note[0] ? "(" : "", note, note[0] ? ")" : "",
+                    mdio.ind_page, mdio.ind_addr);
+            fflush(mdio.log_f);
         }
         if (mdio.log_n < 64) {
             mdio.log_n++;
-            fprintf(stderr, "[mdio] op=%u phy=%u reg=%u data=%#x\n",
-                    op, phy, reg, data);
+            fprintf(stderr, "[mdio] %s phy=%u reg=%u data=%#x -> %#x %s\n",
+                    opname, phy, reg, data, mdio.last_data, note);
         }
     }
 }
