@@ -559,7 +559,13 @@ struct LeopardFEState {
 
 static void leopard_fe_update_irq(LeopardFEState *s)
 {
-    qemu_set_irq(s->irq, (s->int_status & s->int_mask) ? 1 : 0);
+    static int n;
+    int level = (s->int_status & s->int_mask) ? 1 : 0;
+    if (n++ < 16) {
+        fprintf(stderr, "[fe] update_irq level=%d status=%#x mask=%#x\n",
+                level, s->int_status, s->int_mask);
+    }
+    qemu_set_irq(s->irq, level);
 }
 
 static hwaddr leopard_fe_dma_addr(uint32_t reg)
@@ -661,8 +667,14 @@ static ssize_t leopard_fe_receive(NetClientState *nc,
     uint32_t idx = s->rx_drx_idx;
     uint32_t d[4];
     leopard_fe_read_desc(base, idx, d);
+    if (rx_log < 12) {
+        fprintf(stderr, "[fe] RX desc[%u]: d0=%#x d1=%#x d2=%#x d3=%#x ba=%#llx\n",
+                idx, d[0], d[1], d[2], d[3],
+                (unsigned long long)leopard_fe_dma_addr(d[0]));
+    }
     if (d[1] & 0x80000000u) {
         /* HW already wrote here, software hasn't consumed; drop. */
+        if (rx_log < 12) fprintf(stderr, "[fe] RX drop: DDONE already set\n");
         return 0;
     }
     hwaddr ba = leopard_fe_dma_addr(d[0]);
