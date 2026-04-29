@@ -674,12 +674,10 @@ static void leopard_io_kick_cb(void *opaque)
 #define FE_GMAC1_MAC_ADRL      0x50C
 #define FE_PDMA_RX0_BASE_PTR   0x800
 #define FE_PDMA_RX0_MAX_CNT    0x804
-#define FE_PDMA_RX0_CRX_IDX    0x808   /* SW consumer */
-#define FE_PDMA_RX0_DRX_IDX    0x80C   /* HW producer (MTK calls this DRX_PTR) */
+#define FE_PDMA_RX0_CRX_IDX    0x808
 #define FE_PDMA_TX0_BASE_PTR   0x900
 #define FE_PDMA_TX0_MAX_CNT    0x904
-#define FE_PDMA_TX0_CTX_IDX    0x908   /* SW producer */
-#define FE_PDMA_TX0_DTX_IDX    0x90C   /* HW consumer */
+#define FE_PDMA_TX0_CTX_IDX    0x908
 #define FE_PDMA_GLO_CFG        0xA04
 #define FE_PDMA_RST_IDX        0xA08
 #define FE_PDMA_DLY_INT_CFG    0xA0C
@@ -920,11 +918,9 @@ static uint64_t leopard_fe_read(void *opaque, hwaddr off, unsigned size)
     case FE_PDMA_RX0_BASE_PTR:return s->rx_base;
     case FE_PDMA_RX0_MAX_CNT: return s->rx_max;
     case FE_PDMA_RX0_CRX_IDX: return s->rx_crx_idx;
-    case FE_PDMA_RX0_DRX_IDX: return s->rx_drx_idx;
     case FE_PDMA_TX0_BASE_PTR:return s->tx_base;
     case FE_PDMA_TX0_MAX_CNT: return s->tx_max;
     case FE_PDMA_TX0_CTX_IDX: return s->tx_ctx_idx;
-    case FE_PDMA_TX0_DTX_IDX: return s->tx_dtx_idx;
     case FE_PDMA_GLO_CFG:
         /* Always report TX/RX_DMA_BUSY clear (bits 1 and 3). */
         return s->glo_cfg & ~0x0Au;
