@@ -731,6 +731,13 @@ struct LeopardFEState {
 #define LEOPARD_FE_RX_BUF_SIZE  2048
 #define LEOPARD_FE_RX_POOL_BASE 0x41E00000   /* 14 MiB into 32 MiB DRAM */
     bool     rx_buf_posted[1024];
+
+    /* Backing store for previously-unhandled FE control registers
+     * (PPE block at 0x0E00-0x0EFF and a few neighbours). The firmware
+     * polls some of these for ready bits; just returning 0 stalls it.
+     * Track value-writes per offset so reads see what the driver
+     * stored. */
+    uint32_t fe_misc[0x1000 / 4];
 };
 
 static void leopard_fe_update_irq(LeopardFEState *s)
@@ -882,8 +889,17 @@ static ssize_t leopard_fe_receive(NetClientState *nc,
     hwaddr ba = leopard_fe_dma_addr(d[0]);
     address_space_write(&address_space_memory, ba,
                         MEMTXATTRS_UNSPECIFIED, buf, size);
-    /* DDONE=1, length in lower 14 bits */
-    d[1] = 0x80000000u | (uint32_t)(size & 0x3fff);
+    /* MTK PDMA RX descriptor:
+     *   d[1] bit 31 = DDONE (HW filled), bits 29:16 = PLEN0 (packet len)
+     *   d[2] = VLAN tag / hash / RSS info (left zero — no VLAN)
+     *   d[3] = bits 22:19 = SPORT (source switch port + 1, 1..4 for LAN)
+     *
+     * SPORT must be non-zero or the firmware's RX driver treats this as
+     * an invalid descriptor and drops the packet.  Use port 1 (= eth1)
+     * which is always part of the LAN bridge per boot UART. */
+    d[1] = 0x80000000u | ((uint32_t)(size & 0x3fff) << 16);
+    d[2] = 0;
+    d[3] = (1u << 19);                /* SPORT = 1 (= eth1) */
     leopard_fe_write_desc(base, idx, d);
     s->rx_drx_idx = (idx + 1) % s->rx_max;
 
@@ -912,7 +928,10 @@ static uint64_t leopard_fe_read(void *opaque, hwaddr off, unsigned size)
     case FE_PDMA_DLY_INT_CFG: return s->dly_int_cfg;
     case FE_PDMA_INT_STATUS:  return s->int_status;
     case FE_PDMA_INT_MASK:    return s->int_mask;
-    default:                  return 0;
+    default:
+        /* Return what was previously written for any otherwise-
+         * unhandled offset (PPE control registers etc.). */
+        return s->fe_misc[(off & 0xfff) >> 2];
     }
 }
 
@@ -982,10 +1001,12 @@ static void leopard_fe_write(void *opaque, hwaddr off,
         leopard_fe_update_irq(s);
         break;
     default: {
-        /* Log unhandled writes once each so we can see what the firmware
-         * is poking outside the registers we model. */
-        static uint8_t seen[0x1000];
+        /* Store the value so subsequent reads return it (the firmware
+         * polls some PPE bits and stalls if they're stuck at 0). */
         unsigned o = (unsigned)off & 0xfff;
+        s->fe_misc[o >> 2] = (uint32_t)val;
+        /* Log distinct offsets once each. */
+        static uint8_t seen[0x1000];
         if (!seen[o]) {
             seen[o] = 1;
             CPUState *cs = qemu_get_cpu(0);
