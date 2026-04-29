@@ -696,42 +696,23 @@ static void leopard_pc_sample_cb(void *opaque)
             leopard_seen_ifexec = true;
         }
 
-        /* One-shot LAN-IP injection: once the firmware settles into its
-         * idle loop (PC=0x40205568 reached for the Nth time), redirect
-         * the CPU to call ifconfig_exec("br0 inet 192.168.1.1 netmask
-         * 255.255.255.0"). This is the IP-binding path that the dead
-         * lanStart() function would have driven; we synthesise it
-         * instead. After the call returns to LR (idle PC), boot
-         * resumes with the LAN interface bound. */
-        static int idle_count = 0;
-        static bool injected = false;
-        if (!injected && pc == 0x40205568) {
-            if (++idle_count >= 50) {
-                /* Pick interface candidates in priority order. We don't
-                 * know the LAN ifname for sure — try "br0" first; the
-                 * stub re-runs with successive names if the first fails. */
-                static const char cmd[] =
-                    "eth1 inet 192.168.1.1 netmask 255.255.255.0";
-                /* Free zero-padding region used by the switchPhy patch
-                 * is at 0x405b58d8..+1404. We embedded a vtable in the
-                 * first 64 bytes; place the cmd string at +0x80. */
-                hwaddr cmd_addr = 0x405b5958;
-                cpu_physical_memory_write(cmd_addr, cmd, sizeof(cmd));
-                fprintf(stderr,
-                    "[inject] *** firing ifconfig_exec(\"%s\") "
-                    "  cmd@%#x  return->%#x\n",
-                    cmd, (uint32_t)cmd_addr, lr);
-                /* Set up registers: r0 = cmd ptr, lr = current pc (so
-                 * we return into the idle loop), pc = 0x40526d7c. */
-                acpu->env.regs[0]  = (uint32_t)cmd_addr;
-                acpu->env.regs[14] = pc;
-                acpu->env.regs[15] = 0x40526d7c;
-                injected = true;
-            }
+        /* (Injection now done via firmware stub patch — see
+         * scripts/patch_inject_lan_ip.py. The stub fires from a real
+         * task context inside the PPE-add function, where the lazy
+         * semaphore in ifconfig_exec can be safely created.) */
+        if (pc == 0x403bcf98) {
+            static int n; if (++n <= 30)
+                fprintf(stderr, "[watch] ppe_add hit #%d r0=%#x lr=%#x sp=%#x\n",
+                        n, acpu->env.regs[0], lr, sp);
+        }
+        if (pc >= 0x405b5800 && pc < 0x405b5848) {
+            static int n; if (++n <= 30)
+                fprintf(stderr, "[watch] stub pc=%#x lr=%#x sp=%#x\n",
+                        pc, lr, sp);
         }
     }
     int64_t ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    timer_mod(leopard_pc_sample_timer, ns + 1 * 1000 * 1000); /* 1 ms */
+    timer_mod(leopard_pc_sample_timer, ns + 50 * 1000); /* 50 us */
 }
 
 /* Periodic I/O kick: the RTOS polls UART LSR in a tight loop which can
