@@ -981,7 +981,21 @@ static void leopard_fe_write(void *opaque, hwaddr off,
         s->int_mask = val;
         leopard_fe_update_irq(s);
         break;
-    default: break;
+    default: {
+        /* Log unhandled writes once each so we can see what the firmware
+         * is poking outside the registers we model. */
+        static uint8_t seen[0x1000];
+        unsigned o = (unsigned)off & 0xfff;
+        if (!seen[o]) {
+            seen[o] = 1;
+            CPUState *cs = qemu_get_cpu(0);
+            ARMCPU *acpu = ARM_CPU(cs);
+            uint32_t pc = acpu ? acpu->env.regs[15] : 0;
+            fprintf(stderr, "[fe] WR unhandled %#06x = %#x  (pc=%#x)\n",
+                    o, (unsigned)val, pc);
+        }
+        break;
+    }
     }
 }
 
