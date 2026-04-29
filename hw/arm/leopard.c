@@ -644,6 +644,21 @@ static void leopard_tick_cb(void *opaque)
     timer_mod(leopard_tick_timer, ns + 1000000); /* 1 ms */
 }
 
+/* Deferred ARP-reply infrastructure: see leopard_fe_receive's ARP
+ * auto-reply block.  We can't call qemu_send_packet re-entrantly from
+ * the receive callback, so we stash the reply and fire it from a
+ * one-shot timer ~100us later. */
+static uint8_t       leopard_arp_reply[42];
+static NICState     *leopard_arp_nic;
+static QEMUTimer    *leopard_arp_send_timer;
+static void leopard_arp_send_cb(void *opaque)
+{
+    if (leopard_arp_nic) {
+        qemu_send_packet(qemu_get_queue(leopard_arp_nic),
+                         leopard_arp_reply, sizeof(leopard_arp_reply));
+    }
+}
+
 /* PC sampler: every N ms log current PC + LR.  Useful for diagnosing
  * boot hangs without GDB - if the firmware sits in a tight loop, the
  * sampled PCs will cluster in that loop. */
@@ -878,7 +893,93 @@ static ssize_t leopard_fe_receive(NetClientState *nc,
         fprintf(stderr, "[fe] RX size=%zu glo=%#x base=%#x max=%u drx=%u crx=%u\n",
                 size, s->glo_cfg, s->rx_base, s->rx_max,
                 s->rx_drx_idx, s->rx_crx_idx);
+        /* Hexdump first 64 bytes so we can verify the L2/L3 headers
+         * (in particular: is the dest MAC the firmware's MAC?). */
+        size_t dump = size < 64 ? size : 64;
+        fprintf(stderr, "[fe] RX bytes:");
+        for (size_t i = 0; i < dump; i++) {
+            if (i % 16 == 0) fprintf(stderr, "\n[fe]   %04zx:", i);
+            fprintf(stderr, " %02x", buf[i]);
+        }
+        fprintf(stderr, "\n");
     }
+    /* ARP auto-reply: the firmware's IP layer doesn't actually have an
+     * IP assigned (or the bridge<->IP-stack glue is incomplete in our
+     * synthetic build), so it never replies to ARP requests for its
+     * own IP.  slirp learns guest MACs only by observing outbound
+     * traffic; with no firmware ARP reply, slirp never delivers the
+     * SYN to the firmware's MAC, and host->guest TCP times out.
+     *
+     * Stand in for the firmware's ARP layer: when we see an ARP
+     * request for 192.168.1.1, generate the reply ourselves and
+     * inject it back via the NIC's TX queue.  This is the same kind
+     * of "fake what the firmware should be doing" that we already do
+     * for PHY/MDIO.
+     *
+     * Ethernet frame layout for ARP:
+     *   [0..5]   dst MAC
+     *   [6..11]  src MAC
+     *   [12..13] ethertype = 0x0806
+     *   [14..15] htype = 0x0001 (Ethernet)
+     *   [16..17] ptype = 0x0800 (IPv4)
+     *   [18]     hlen = 6, [19] plen = 4
+     *   [20..21] op (1=request, 2=reply)
+     *   [22..27] sender HW
+     *   [28..31] sender IP
+     *   [32..37] target HW
+     *   [38..41] target IP
+     */
+    if (size >= 42 && buf[12] == 0x08 && buf[13] == 0x06 &&
+        buf[20] == 0x00 && buf[21] == 0x01) {
+        /* ARP request.  Target IP at bytes 38..41. */
+        uint32_t our_ip = (192u<<24) | (168u<<16) | (1u<<8) | 1u;
+        uint32_t tgt_ip = ((uint32_t)buf[38]<<24) | ((uint32_t)buf[39]<<16) |
+                          ((uint32_t)buf[40]<<8)  | (uint32_t)buf[41];
+        if (tgt_ip == our_ip) {
+            /* Build a 42-byte ARP reply. */
+            uint8_t reply[42] = {0};
+            /* Use the firmware's actual GMAC1 MAC (read from registers
+             * the firmware programmed). MAC_ADRH = high 2 bytes,
+             * MAC_ADRL = low 4 bytes (network order). */
+            /* Firmware UART confirms ADRH=high 16 bits=0x0019,
+             * ADRL=low 32 bits=0x66cb8b07 (TP-Link OUI 00:19:66).
+             * Our register names are swapped vs the firmware: s->mac_h
+             * holds what the firmware calls ADRL (low 4 bytes), and
+             * s->mac_l holds ADRH (high 2 bytes). */
+            uint32_t adrh = s->mac_l;
+            uint32_t adrl = s->mac_h;
+            uint8_t fw_mac[6];
+            fw_mac[0] = (adrh >> 8) & 0xff;
+            fw_mac[1] = (adrh >> 0) & 0xff;
+            fw_mac[2] = (adrl >> 24) & 0xff;
+            fw_mac[3] = (adrl >> 16) & 0xff;
+            fw_mac[4] = (adrl >> 8) & 0xff;
+            fw_mac[5] = (adrl >> 0) & 0xff;
+            /* dst = sender of request */
+            memcpy(reply + 0, buf + 6, 6);
+            memcpy(reply + 6, fw_mac, 6);
+            reply[12] = 0x08; reply[13] = 0x06;
+            reply[14] = 0x00; reply[15] = 0x01;
+            reply[16] = 0x08; reply[17] = 0x00;
+            reply[18] = 6; reply[19] = 4;
+            reply[20] = 0x00; reply[21] = 0x02;       /* reply */
+            memcpy(reply + 22, fw_mac, 6);
+            reply[26] = 192; reply[27] = 168; reply[28] = 1; reply[29] = 1;
+            memcpy(reply + 32, buf + 22, 6);          /* tgt HW = orig sender HW */
+            memcpy(reply + 38, buf + 28, 4);          /* tgt IP = orig sender IP */
+            fprintf(stderr, "[fe] ARP auto-reply: %02x:%02x:%02x:%02x:%02x:%02x is 192.168.1.1\n",
+                    fw_mac[0], fw_mac[1], fw_mac[2], fw_mac[3], fw_mac[4], fw_mac[5]);
+            /* Try both: direct send AND deferred send.  Slirp may
+             * filter re-entrant sends; the deferred path catches that. */
+            qemu_send_packet(qemu_get_queue(s->nic), reply, sizeof(reply));
+            memcpy(leopard_arp_reply, reply, sizeof(reply));
+            leopard_arp_nic = s->nic;
+            timer_mod(leopard_arp_send_timer,
+                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100000);
+            return size;  /* swallow the request */
+        }
+    }
+
     if (!(s->glo_cfg & 4)) return 0;
     if (!s->rx_base || !s->rx_max) return 0;
     if (size > 1600) return size;        /* drop oversize */
@@ -1409,6 +1510,10 @@ static void leopard_init(MachineState *machine)
                                            leopard_pc_sample_cb, NULL);
     timer_mod(leopard_pc_sample_timer,
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100 * 1000 * 1000);
+
+    /* Pre-create ARP send timer so the receive path can just timer_mod it. */
+    leopard_arp_send_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                          leopard_arp_send_cb, NULL);
 
     /* Stash a barebones boot info for completeness; arm_load_kernel is not
      * called because we are loading raw U-Boot, not a Linux kernel. */
