@@ -717,6 +717,20 @@ struct LeopardFEState {
     uint32_t int_status;
 
     bool     enabled_logged;
+
+    /* Auto-buffer pool for RX.  The firmware's FE init initializes
+     * every RX descriptor to {d0=0, d1=DDONE|LSO=0xc0000000} as a
+     * "marked as already-consumed empty placeholder, awaiting per-port
+     * driver to post real buffers".  In our model the per-port driver
+     * never runs (the production firmware relies on bootloader-stage
+     * driver registration we don't replicate), so we substitute by
+     * allocating one DRAM buffer per descriptor lazily on first arrival
+     * and patching the descriptor ourselves.  This keeps the firmware's
+     * GMAC RX / VLAN / bridge / IP stack on the faithful code path -
+     * we're only doing what the per-port driver would have done. */
+#define LEOPARD_FE_RX_BUF_SIZE  2048
+#define LEOPARD_FE_RX_POOL_BASE 0x41E00000   /* 14 MiB into 32 MiB DRAM */
+    bool     rx_buf_posted[1024];
 };
 
 static void leopard_fe_update_irq(LeopardFEState *s)
@@ -772,9 +786,17 @@ static void leopard_fe_kick_tx(LeopardFEState *s)
         leopard_fe_read_desc(base, s->tx_dtx_idx, d);
         uint32_t buf_phys = d[0];
         uint32_t ctrl     = d[1];
-        /* MTK PDMA TX: bit31 of DMAD1 is DDONE — for TX, HW sets it after
-         * sending; SW posts with it cleared. Just go ahead and send. */
-        uint32_t len = ctrl & 0x3fff;
+        /* MTK PDMA TX descriptor:
+         *   d[0] = buffer phys
+         *   d[1] = bit31 DDONE | bit30 LS0 | bits29:16 PLEN0 | bits15:14 ?
+         *          | bits13:0 PLEN1
+         * For a single-segment packet, total length is PLEN0.  Some
+         * builds also queue two-segment packets where PLEN1 holds the
+         * second segment length; we accept the larger of the two as
+         * the buffer length to send. */
+        uint32_t plen0 = (ctrl >> 16) & 0x3fff;
+        uint32_t plen1 = ctrl & 0x3fff;
+        uint32_t len = plen0 ? plen0 : plen1;
         if (len && len <= 1600) {
             uint8_t buf[1600];
             hwaddr ba = leopard_fe_dma_addr(buf_phys);
@@ -834,6 +856,24 @@ static ssize_t leopard_fe_receive(NetClientState *nc,
                 idx, d[0], d[1], d[2], d[3],
                 (unsigned long long)leopard_fe_dma_addr(d[0]));
     }
+
+    /* Firmware-init "empty placeholder" pattern: d0 = 0, d1 = DDONE|LSO.
+     * The production per-port driver would normally clear DDONE and
+     * post a real buffer; our build never runs that driver, so do it
+     * here on the fly.  We allocate one fixed-size buffer per ring slot
+     * lazily out of an unused DRAM region. */
+    if (d[0] == 0 && d[1] == 0xc0000000u && idx < 1024) {
+        uint32_t buf_pa = LEOPARD_FE_RX_POOL_BASE + idx * LEOPARD_FE_RX_BUF_SIZE;
+        d[0] = buf_pa;        /* buffer physical address */
+        d[1] = 0;             /* DDONE=0 -> ready for HW fill */
+        leopard_fe_write_desc(base, idx, d);
+        s->rx_buf_posted[idx] = true;
+        if (rx_log < 12) {
+            fprintf(stderr, "[fe] RX auto-post idx=%u buf=%#x\n",
+                    idx, buf_pa);
+        }
+    }
+
     if (d[1] & 0x80000000u) {
         /* HW already wrote here, software hasn't consumed; drop. */
         if (rx_log < 12) fprintf(stderr, "[fe] RX drop: DDONE already set\n");
