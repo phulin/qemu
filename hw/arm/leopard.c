@@ -935,10 +935,22 @@ static void leopard_fe_write(void *opaque, hwaddr off,
         break;
     case FE_PDMA_TX0_BASE_PTR: s->tx_base = val; break;
     case FE_PDMA_TX0_MAX_CNT:  s->tx_max = val; break;
-    case FE_PDMA_TX0_CTX_IDX:
+    case FE_PDMA_TX0_CTX_IDX: {
+        /* Log the writer PC the first 32 times so we can identify
+         * which firmware function is kicking TX. */
+        static int kick_log = 0;
+        if (kick_log++ < 32) {
+            CPUState *cs = qemu_get_cpu(0);
+            ARMCPU *acpu = ARM_CPU(cs);
+            uint32_t pc = acpu ? acpu->env.regs[15] : 0;
+            uint32_t lr = acpu ? acpu->env.regs[14] : 0;
+            fprintf(stderr, "[fe] TX kick ctx=%u (was %u) pc=%#x lr=%#x\n",
+                    (unsigned)val, s->tx_ctx_idx, pc, lr);
+        }
         s->tx_ctx_idx = val;
         leopard_fe_kick_tx(s);
         break;
+    }
     case FE_PDMA_GLO_CFG: {
         uint32_t old = s->glo_cfg;
         s->glo_cfg = val;
