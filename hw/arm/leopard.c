@@ -664,20 +664,74 @@ static void leopard_arp_send_cb(void *opaque)
  * sampled PCs will cluster in that loop. */
 static QEMUTimer *leopard_pc_sample_timer;
 static int        leopard_pc_sample_n;
+/* Track whether each watched PC range has been observed at any sample tick. */
+static bool leopard_seen_lanstart;
+static bool leopard_seen_ifexec;
 static void leopard_pc_sample_cb(void *opaque)
 {
-    if (leopard_pc_sample_n++ < 200) {
-        CPUState *cs = qemu_get_cpu(0);
-        if (cs) {
-            ARMCPU *acpu = ARM_CPU(cs);
-            uint32_t pc = acpu->env.regs[15];
-            uint32_t lr = acpu->env.regs[14];
-            uint32_t sp = acpu->env.regs[13];
+    CPUState *cs = qemu_get_cpu(0);
+    if (cs) {
+        ARMCPU *acpu = ARM_CPU(cs);
+        uint32_t pc = acpu->env.regs[15];
+        uint32_t lr = acpu->env.regs[14];
+        uint32_t sp = acpu->env.regs[13];
+        if (leopard_pc_sample_n < 200) {
             fprintf(stderr, "[pc-sample] pc=%#x lr=%#x sp=%#x\n", pc, lr, sp);
+        }
+        leopard_pc_sample_n++;
+        /* Watch for entry into lanStart / ifconfig_exec. The sampler is
+         * coarse-grained (1 ms below) so we only catch them if they
+         * loop or block. Also catch by observing LR pointing back into
+         * either function. */
+        if (!leopard_seen_lanstart &&
+            ((pc >= 0x404124b0 && pc < 0x404128ec) ||
+             (lr >= 0x404124b0 && lr < 0x404128ec))) {
+            fprintf(stderr, "[watch] *** lanStart REACHED  pc=%#x lr=%#x\n", pc, lr);
+            leopard_seen_lanstart = true;
+        }
+        if (!leopard_seen_ifexec &&
+            ((pc >= 0x40526d7c && pc < 0x40527c00) ||
+             (lr >= 0x40526d7c && lr < 0x40527c00))) {
+            fprintf(stderr, "[watch] *** ifconfig_exec REACHED  pc=%#x lr=%#x\n", pc, lr);
+            leopard_seen_ifexec = true;
+        }
+
+        /* One-shot LAN-IP injection: once the firmware settles into its
+         * idle loop (PC=0x40205568 reached for the Nth time), redirect
+         * the CPU to call ifconfig_exec("br0 inet 192.168.1.1 netmask
+         * 255.255.255.0"). This is the IP-binding path that the dead
+         * lanStart() function would have driven; we synthesise it
+         * instead. After the call returns to LR (idle PC), boot
+         * resumes with the LAN interface bound. */
+        static int idle_count = 0;
+        static bool injected = false;
+        if (!injected && pc == 0x40205568) {
+            if (++idle_count >= 50) {
+                /* Pick interface candidates in priority order. We don't
+                 * know the LAN ifname for sure — try "br0" first; the
+                 * stub re-runs with successive names if the first fails. */
+                static const char cmd[] =
+                    "eth1 inet 192.168.1.1 netmask 255.255.255.0";
+                /* Free zero-padding region used by the switchPhy patch
+                 * is at 0x405b58d8..+1404. We embedded a vtable in the
+                 * first 64 bytes; place the cmd string at +0x80. */
+                hwaddr cmd_addr = 0x405b5958;
+                cpu_physical_memory_write(cmd_addr, cmd, sizeof(cmd));
+                fprintf(stderr,
+                    "[inject] *** firing ifconfig_exec(\"%s\") "
+                    "  cmd@%#x  return->%#x\n",
+                    cmd, (uint32_t)cmd_addr, lr);
+                /* Set up registers: r0 = cmd ptr, lr = current pc (so
+                 * we return into the idle loop), pc = 0x40526d7c. */
+                acpu->env.regs[0]  = (uint32_t)cmd_addr;
+                acpu->env.regs[14] = pc;
+                acpu->env.regs[15] = 0x40526d7c;
+                injected = true;
+            }
         }
     }
     int64_t ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    timer_mod(leopard_pc_sample_timer, ns + 100 * 1000 * 1000); /* 100 ms */
+    timer_mod(leopard_pc_sample_timer, ns + 1 * 1000 * 1000); /* 1 ms */
 }
 
 /* Periodic I/O kick: the RTOS polls UART LSR in a tight loop which can
