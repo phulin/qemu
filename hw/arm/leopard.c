@@ -928,10 +928,25 @@ static uint64_t leopard_fe_read(void *opaque, hwaddr off, unsigned size)
     case FE_PDMA_DLY_INT_CFG: return s->dly_int_cfg;
     case FE_PDMA_INT_STATUS:  return s->int_status;
     case FE_PDMA_INT_MASK:    return s->int_mask;
-    default:
+    default: {
         /* Return what was previously written for any otherwise-
          * unhandled offset (PPE control registers etc.). */
-        return s->fe_misc[(off & 0xfff) >> 2];
+        unsigned o = (unsigned)off & 0xfff;
+        uint32_t v = s->fe_misc[o >> 2];
+        /* Log first read of each distinct unhandled offset so we can
+         * spot polling loops that always see 0 (e.g. a "ready" bit the
+         * firmware is waiting on but no driver ever sets). */
+        static uint8_t seen_rd[0x1000];
+        if (!seen_rd[o]) {
+            seen_rd[o] = 1;
+            CPUState *cs = qemu_get_cpu(0);
+            ARMCPU *acpu = ARM_CPU(cs);
+            uint32_t pc = acpu ? acpu->env.regs[15] : 0;
+            fprintf(stderr, "[fe] RD unhandled %#06x = %#x  (pc=%#x)\n",
+                    o, v, pc);
+        }
+        return v;
+    }
     }
 }
 
@@ -945,13 +960,27 @@ static void leopard_fe_write(void *opaque, hwaddr off,
     case FE_GMAC1_MAC_ADRL: s->mac_l = val; break;
     case FE_PDMA_RX0_BASE_PTR: s->rx_base = val; break;
     case FE_PDMA_RX0_MAX_CNT:  s->rx_max = val; break;
-    case FE_PDMA_RX0_CRX_IDX:
+    case FE_PDMA_RX0_CRX_IDX: {
+        /* Log the first 32 consumer-index advances so we can see when
+         * (and from where) the firmware's L2 RX driver actually picks up
+         * delivered packets.  If this never fires after we've delivered
+         * an RX descriptor, the L2 RX path isn't running at all. */
+        static int crx_log = 0;
+        if (crx_log++ < 32) {
+            CPUState *cs = qemu_get_cpu(0);
+            ARMCPU *acpu = ARM_CPU(cs);
+            uint32_t pc = acpu ? acpu->env.regs[15] : 0;
+            uint32_t lr = acpu ? acpu->env.regs[14] : 0;
+            fprintf(stderr, "[fe] RX crx=%u (was %u, drx=%u) pc=%#x lr=%#x\n",
+                    (unsigned)val, s->rx_crx_idx, s->rx_drx_idx, pc, lr);
+        }
         s->rx_crx_idx = val;
         /* Driver consumed up to here — wake any pending receivers. */
         if (s->nic) {
             qemu_flush_queued_packets(qemu_get_queue(s->nic));
         }
         break;
+    }
     case FE_PDMA_TX0_BASE_PTR: s->tx_base = val; break;
     case FE_PDMA_TX0_MAX_CNT:  s->tx_max = val; break;
     case FE_PDMA_TX0_CTX_IDX: {
