@@ -924,6 +924,14 @@ static void leopard_init(MachineState *machine)
         memcpy(flash_buf, nor.flash,
                nor.flash_size < rom_size ? nor.flash_size : rom_size);
         memory_region_add_subregion(sysmem, 0x30000000, flash_rom);
+
+        /* RTOS /flash0 driver hands out 0x9F000000 as the NOR XIP base
+         * (legacy MIPS-KSEG1 convention; vendor reused the constant).
+         * Alias the same backing so miniFsInit can read the MINIFS blob. */
+        MemoryRegion *flash_alias = g_new(MemoryRegion, 1);
+        memory_region_init_alias(flash_alias, NULL, "leopard.nor-xip-alias",
+                                 flash_rom, 0, rom_size);
+        memory_region_add_subregion(sysmem, 0x9F000000, flash_alias);
     }
 
     /* Catch-all RAM stub for the whole peripheral window 0x10000000..0x20000000.
