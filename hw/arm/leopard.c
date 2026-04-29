@@ -644,6 +644,27 @@ static void leopard_tick_cb(void *opaque)
     timer_mod(leopard_tick_timer, ns + 1000000); /* 1 ms */
 }
 
+/* PC sampler: every N ms log current PC + LR.  Useful for diagnosing
+ * boot hangs without GDB - if the firmware sits in a tight loop, the
+ * sampled PCs will cluster in that loop. */
+static QEMUTimer *leopard_pc_sample_timer;
+static int        leopard_pc_sample_n;
+static void leopard_pc_sample_cb(void *opaque)
+{
+    if (leopard_pc_sample_n++ < 200) {
+        CPUState *cs = qemu_get_cpu(0);
+        if (cs) {
+            ARMCPU *acpu = ARM_CPU(cs);
+            uint32_t pc = acpu->env.regs[15];
+            uint32_t lr = acpu->env.regs[14];
+            uint32_t sp = acpu->env.regs[13];
+            fprintf(stderr, "[pc-sample] pc=%#x lr=%#x sp=%#x\n", pc, lr, sp);
+        }
+    }
+    int64_t ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    timer_mod(leopard_pc_sample_timer, ns + 100 * 1000 * 1000); /* 100 ms */
+}
+
 /* Periodic I/O kick: the RTOS polls UART LSR in a tight loop which can
  * starve QEMU's main-loop I/O processing on TCG.  This timer fires
  * frequently to force QEMU to check chardev backends for new data. */
@@ -672,12 +693,20 @@ static void leopard_io_kick_cb(void *opaque)
 #define FE_GDMA1_FWD_CFG       0x500
 #define FE_GMAC1_MAC_ADRH      0x508
 #define FE_GMAC1_MAC_ADRL      0x50C
-#define FE_PDMA_RX0_BASE_PTR   0x800
-#define FE_PDMA_RX0_MAX_CNT    0x804
-#define FE_PDMA_RX0_CRX_IDX    0x808
-#define FE_PDMA_TX0_BASE_PTR   0x900
-#define FE_PDMA_TX0_MAX_CNT    0x904
-#define FE_PDMA_TX0_CTX_IDX    0x908
+/* MTK FE PDMA register layout for this SoC variant: TX block at 0x800,
+ * RX block at 0x900.  We had these swapped originally - the firmware's
+ * UART log "Tx_Ring addr=X / Rx_Ring addr=Y" plus our [fe] PDMA-enabled
+ * trace confirmed which address gets written to which offset.  With the
+ * old (wrong) mapping our model treated the firmware's TX ring as RX
+ * and delivered packets into TX-ring slots - the firmware's RX scanner
+ * never saw any DDONE-set descriptors and the etherPacketAdj path that
+ * fired "m_len(0) less than 14" was hitting a different code path. */
+#define FE_PDMA_TX0_BASE_PTR   0x800
+#define FE_PDMA_TX0_MAX_CNT    0x804
+#define FE_PDMA_TX0_CTX_IDX    0x808
+#define FE_PDMA_RX0_BASE_PTR   0x900
+#define FE_PDMA_RX0_MAX_CNT    0x904
+#define FE_PDMA_RX0_CRX_IDX    0x908
 #define FE_PDMA_GLO_CFG        0xA04
 #define FE_PDMA_RST_IDX        0xA08
 #define FE_PDMA_DLY_INT_CFG    0xA0C
@@ -889,15 +918,28 @@ static ssize_t leopard_fe_receive(NetClientState *nc,
     hwaddr ba = leopard_fe_dma_addr(d[0]);
     address_space_write(&address_space_memory, ba,
                         MEMTXATTRS_UNSPECIFIED, buf, size);
-    /* MTK PDMA RX descriptor:
-     *   d[1] bit 31 = DDONE (HW filled), bits 29:16 = PLEN0 (packet len)
+    /* MTK PDMA RX descriptor.  Different MTK SoC generations encode the
+     * packet length in different bit fields of d[1], and we don't know
+     * a priori which field this firmware reads.  Set the length in
+     * BOTH bits 29:16 (PLEN1) and bits 13:0 (PLEN0) — the previous
+     * encoding (29:16 only) caused this firmware's etherPacketAdj to
+     * see m_len=0 and reject every packet as "less than 14".
+     *
+     *   d[1] bit 31     = DDONE (HW filled)
+     *   d[1] bit 30     = LS0   (last segment of packet)
+     *   d[1] bits 29:16 = PLEN1 / PLEN0-alt (segment 1 length)
+     *   d[1] bits 13:0  = PLEN0 (segment 0 length, primary on this gen)
      *   d[2] = VLAN tag / hash / RSS info (left zero — no VLAN)
-     *   d[3] = bits 22:19 = SPORT (source switch port + 1, 1..4 for LAN)
+     *   d[3] bits 22:19 = SPORT (source switch port + 1, 1..4 for LAN)
      *
      * SPORT must be non-zero or the firmware's RX driver treats this as
      * an invalid descriptor and drops the packet.  Use port 1 (= eth1)
      * which is always part of the LAN bridge per boot UART. */
-    d[1] = 0x80000000u | ((uint32_t)(size & 0x3fff) << 16);
+    uint32_t len14 = (uint32_t)(size & 0x3fff);
+    d[1] = 0x80000000u                  /* DDONE */
+         | 0x40000000u                  /* LS0 - single-segment packet */
+         | (len14 << 16)                /* PLEN1 */
+         | len14;                       /* PLEN0 */
     d[2] = 0;
     d[3] = (1u << 19);                /* SPORT = 1 (= eth1) */
     leopard_fe_write_desc(base, idx, d);
@@ -1361,6 +1403,12 @@ static void leopard_init(MachineState *machine)
                                          leopard_io_kick_cb, NULL);
     timer_mod(leopard_io_kick_timer,
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000000);
+
+    /* Start PC sampler */
+    leopard_pc_sample_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                           leopard_pc_sample_cb, NULL);
+    timer_mod(leopard_pc_sample_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100 * 1000 * 1000);
 
     /* Stash a barebones boot info for completeness; arm_load_kernel is not
      * called because we are loading raw U-Boot, not a Linux kernel. */
