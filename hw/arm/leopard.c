@@ -807,6 +807,64 @@ static void leopard_pc_sample_cb(void *opaque)
                     pc, lr, leopard_pc_sample_n);
             }
         }
+        /* Once the lifecycle is past the systool/wlan stage,
+         * dump the Handlers struct addresses for each app so we
+         * know all the per-app phase handlers (Reset/Init/Start/...). */
+        {
+            static int dumped_apps;
+            if (!dumped_apps && leopard_pc_sample_n == 30000) {
+                dumped_apps = 1;
+                /* App entries: name@entry+4, handlers_ptr@entry+0x224 */
+                static const struct { const char *name; uint32_t addr; } apps[] = {
+                    {"main",      0x407329F4},
+                    {"forward",   0x40732C28},
+                    {"systool",   0x40732358},
+                    {"wlan",      0x407327C0},
+                    {"wan",       0x40731EF0},
+                    {"advanced",  0x4073372C},
+                    {"mesh",      0x40732E5C},
+                    {"onemesh",   0x40732124},
+                    {"emesh",     0x40733960},
+                    {"cwmp",      0x4073258C},
+                    {"apsd",      0x40733B94},
+                    {"tpapp",     0x407332C4},
+                    {"portal",    0x40733090},
+                    {"smartHome", 0x407334F8},
+                    {NULL, 0}
+                };
+                /* Dump the JSON-API handler table at 0x40683B8C
+                 * (8-byte slots indexed by uVar4 in FUN_403FF1F0;
+                 * each slot = (handler_ptr, aux_check_ptr)). */
+                fprintf(stderr, "[api-handler-table @ 0x40683B8C]\n");
+                for (int i = 0; i < 32; i++) {
+                    uint32_t pair[2] = {0};
+                    cpu_physical_memory_read(0x40683B8C + i * 8,
+                                             pair, sizeof(pair));
+                    if (pair[0] || pair[1]) {
+                        fprintf(stderr,
+                            "  slot[%d] @ %#x: handler=%#x aux=%#x\n",
+                            i, 0x40683B8C + i * 8, pair[0], pair[1]);
+                    }
+                }
+                fprintf(stderr, "[app-handlers-dump]\n");
+                for (int i = 0; apps[i].name; i++) {
+                    uint32_t handlers_ptr = 0;
+                    cpu_physical_memory_read(apps[i].addr + 0x224,
+                                             &handlers_ptr, 4);
+                    if (handlers_ptr == 0) {
+                        fprintf(stderr, "  %-10s entry=%#x handlers=NULL\n",
+                                apps[i].name, apps[i].addr);
+                        continue;
+                    }
+                    uint32_t hh[6] = {0};
+                    cpu_physical_memory_read(handlers_ptr, hh, sizeof(hh));
+                    fprintf(stderr,
+                        "  %-10s entry=%#x handlers=%#x  reset=%#x init=%#x start=%#x +c=%#x +10=%#x +14=%#x\n",
+                        apps[i].name, apps[i].addr, handlers_ptr,
+                        hh[0], hh[1], hh[2], hh[3], hh[4], hh[5]);
+                }
+            }
+        }
         /* When PC is in the RTOS scheduler / yield code, record LR
          * — that's the address inside whatever task function is
          * yielding. The set of distinct LRs seen tells us which
