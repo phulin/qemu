@@ -751,6 +751,89 @@ static void leopard_pc_sample_cb(void *opaque)
                     leopard_pc_sample_n, pc, lr, sp);
         }
         leopard_pc_sample_n++;
+        /* Track the high-water-mark PC inside wlan_start's body
+         * (0x403C87C0..0x403C8AB0). Tells us how far wlan's start
+         * handler progresses before the lifecycle stalls there.
+         * Also track LR while inside, to identify synchronous BL
+         * destinations from inside the function. */
+        {
+            static uint32_t wlan_high_pc;
+            static uint32_t wlan_high_lr;
+            static int wlan_seen, wlan_dumped;
+            if (pc >= 0x403C87C0 && pc < 0x403C8AB0) {
+                wlan_seen++;
+                if (pc > wlan_high_pc) {
+                    wlan_high_pc = pc;
+                    wlan_high_lr = lr;
+                }
+            }
+            /* After a long quiet period (warmup + many late ticks),
+             * report once. */
+            if (!wlan_dumped && leopard_pc_sample_n == 50000) {
+                wlan_dumped = 1;
+                fprintf(stderr,
+                    "[wlan-progress] seen=%d high_pc=%#x high_lr=%#x\n",
+                    wlan_seen, wlan_high_pc, wlan_high_lr);
+            }
+        }
+        /* Catch every distinct LR observed while PC is anywhere
+         * inside FUN_403C87C0 (wlan_start). Each unique LR is a
+         * BL return target inside wlan_start. The set of LRs tells
+         * us which BL sites get past, and which one is the last
+         * before the hang. */
+        if (pc >= 0x403C87C0 && pc < 0x403C8AB0) {
+            static uint32_t lrs[32];
+            static int n_lrs;
+            int found = 0;
+            for (int i = 0; i < n_lrs; i++) if (lrs[i] == lr) { found = 1; break; }
+            if (!found && n_lrs < 32) {
+                lrs[n_lrs++] = lr;
+                fprintf(stderr,
+                    "[wlan-lr] new lr=%#x at pc=%#x (n=%d total=%d)\n",
+                    lr, pc, leopard_pc_sample_n, n_lrs);
+            }
+        }
+        /* Did ctrlAppStart's blx site at 0x4048B5B8 ever return?
+         * The instruction after the blx is at 0x4048B5BC; the loop
+         * increment begins around 0x4048B5BC..0x4048B5DC. If PC is
+         * never seen here for wlan iteration, wlan's start handler
+         * never returned. */
+        if (pc >= 0x4048B5BC && pc <= 0x4048B5DC) {
+            static int hits;
+            if (hits < 5) {
+                hits++;
+                fprintf(stderr,
+                    "[ctrlAppStart-postblx] pc=%#x lr=%#x at n=%d\n",
+                    pc, lr, leopard_pc_sample_n);
+            }
+        }
+        /* When PC is in the RTOS scheduler / yield code, record LR
+         * — that's the address inside whatever task function is
+         * yielding. The set of distinct LRs seen tells us which
+         * functions are sleeping. */
+        if (pc >= 0x40205000 && pc < 0x40205800) {
+            static uint32_t lrs[64]; static uint32_t lr_count[64]; static int n_lrs;
+            int found = -1;
+            for (int i = 0; i < n_lrs; i++) if (lrs[i] == lr) { found = i; break; }
+            if (found < 0 && n_lrs < 64) {
+                lrs[n_lrs] = lr; lr_count[n_lrs] = 1; n_lrs++;
+                fprintf(stderr,
+                    "[sched-yield-lr] new lr=%#x at pc=%#x (n=%d total=%d)\n",
+                    lr, pc, leopard_pc_sample_n, n_lrs);
+            } else if (found >= 0) {
+                lr_count[found]++;
+            }
+            /* Periodically dump top yield LRs (the blockers). */
+            if (leopard_pc_sample_n == 80000) {
+                fprintf(stderr, "[sched-yield-summary] %d distinct LRs:\n", n_lrs);
+                for (int i = 0; i < n_lrs; i++) {
+                    if (lr_count[i] >= 50) {
+                        fprintf(stderr, "   lr=%#x  count=%u\n",
+                                lrs[i], lr_count[i]);
+                    }
+                }
+            }
+        }
         /* Trace httpd route-registration callsites — pin down whether
          * FUN_4045F954 actually executed its route loop. */
         if (pc == 0x40460784 || pc == 0x40460808) {
