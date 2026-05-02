@@ -110,7 +110,7 @@ static void leopard_log_access(hwaddr a, bool is_write, uint64_t val, unsigned s
  * use the backing file.
  */
 #define NOR_BASE  0x11014000
-#define NOR_SIZE  0x100
+#define NOR_SIZE  0x1000
 
 static struct {
     uint8_t  prg[6];     /* PRGDATA0..5 */
@@ -120,6 +120,14 @@ static struct {
     uint8_t  rdata;
     uint8_t  *flash;     /* mmap'd ctf-firmware.bin */
     size_t   flash_size;
+    uint32_t sf_dma_cmd;
+    uint32_t sf_dma_flash_src;
+    uint32_t sf_dma_dst;
+    uint32_t sf_dma_end;
+    uint32_t sf_dma_last_flash_src;
+    uint32_t sf_dma_last_dst;
+    uint32_t sf_dma_last_end;
+    bool     sf_dma_copied;
 } nor;
 
 static void nor_load_flash(void)
@@ -201,6 +209,39 @@ static void nor_do_pio_read(void)
                 nor.flash[addr] : 0xff;
 }
 
+static void nor_try_sf_dma(void)
+{
+    uint32_t len;
+
+    if (!nor.flash || !nor.sf_dma_dst || nor.sf_dma_end <= nor.sf_dma_dst) {
+        return;
+    }
+
+    len = nor.sf_dma_end - nor.sf_dma_dst;
+    if (len > MiB || nor.sf_dma_flash_src > nor.flash_size ||
+        len > nor.flash_size - nor.sf_dma_flash_src) {
+        return;
+    }
+
+    if (nor.sf_dma_copied &&
+        nor.sf_dma_last_flash_src == nor.sf_dma_flash_src &&
+        nor.sf_dma_last_dst == nor.sf_dma_dst &&
+        nor.sf_dma_last_end == nor.sf_dma_end) {
+        return;
+    }
+
+    address_space_write(&address_space_memory, nor.sf_dma_dst,
+                        MEMTXATTRS_UNSPECIFIED,
+                        nor.flash + nor.sf_dma_flash_src, len);
+    nor.sf_dma_last_flash_src = nor.sf_dma_flash_src;
+    nor.sf_dma_last_dst = nor.sf_dma_dst;
+    nor.sf_dma_last_end = nor.sf_dma_end;
+    nor.sf_dma_copied = true;
+    fprintf(stderr,
+            "[nor] sf-dma copy flash=%#x -> dram=%#x len=%#x cmd=%#x\n",
+            nor.sf_dma_flash_src, nor.sf_dma_dst, len, nor.sf_dma_cmd);
+}
+
 static uint64_t leopard_unmap_read(void *opaque, hwaddr off, unsigned size)
 {
     hwaddr abs = NOR_BASE + off;
@@ -213,6 +254,11 @@ static uint64_t leopard_unmap_read(void *opaque, hwaddr off, unsigned size)
         case 0x38: v = nor.shreg[0]; break;
         case 0x3c: v = nor.shreg[1]; break;
         case 0x40: v = nor.shreg[2]; break;
+        case 0x718:
+            /* Serial-flash DMA status: complete immediately after copying. */
+            nor_try_sf_dma();
+            v = 0;
+            break;
         default:   v = 0;
         }
     }
@@ -239,6 +285,26 @@ static void leopard_unmap_write(void *opaque, hwaddr off,
         case 0x2c: nor.prg[3] = val; break;
         case 0x30: nor.prg[4] = val; break;
         case 0x34: nor.prg[5] = val; break;
+        case 0x718:
+            nor.sf_dma_cmd = val;
+            nor.sf_dma_copied = false;
+            nor_try_sf_dma();
+            break;
+        case 0x71c:
+            nor.sf_dma_flash_src = val;
+            nor.sf_dma_copied = false;
+            nor_try_sf_dma();
+            break;
+        case 0x720:
+            nor.sf_dma_dst = val;
+            nor.sf_dma_copied = false;
+            nor_try_sf_dma();
+            break;
+        case 0x724:
+            nor.sf_dma_end = val;
+            nor.sf_dma_copied = false;
+            nor_try_sf_dma();
+            break;
         }
     }
     leopard_log_access(abs, true, val, size);
@@ -667,6 +733,7 @@ static int        leopard_pc_sample_n;
 /* Track whether each watched PC range has been observed at any sample tick. */
 static bool leopard_seen_lanstart;
 static bool leopard_seen_ifexec;
+static uint32_t leopard_debug_read32(uint32_t addr);
 static void leopard_pc_sample_cb(void *opaque)
 {
     CPUState *cs = qemu_get_cpu(0);
@@ -677,8 +744,198 @@ static void leopard_pc_sample_cb(void *opaque)
         uint32_t sp = acpu->env.regs[13];
         if (leopard_pc_sample_n < 200) {
             fprintf(stderr, "[pc-sample] pc=%#x lr=%#x sp=%#x\n", pc, lr, sp);
+        } else if (leopard_pc_sample_n % 4000 == 0) {
+            /* After warmup, print every 4000th sample (~200ms at 50us)
+             * to expose late-boot hang points. */
+            fprintf(stderr, "[pc-sample-late n=%d] pc=%#x lr=%#x sp=%#x\n",
+                    leopard_pc_sample_n, pc, lr, sp);
         }
         leopard_pc_sample_n++;
+        /* Trace httpd route-registration callsites — pin down whether
+         * FUN_4045F954 actually executed its route loop. */
+        if (pc == 0x40460784 || pc == 0x40460808) {
+            static int n;
+            if (n < 50) {
+                fprintf(stderr,
+                    "[httpd-route] pc=%#x lr=%#x r0=%#x r1=%#x r2=%#x\n",
+                    pc, lr, acpu->env.regs[0], acpu->env.regs[1],
+                    acpu->env.regs[2]);
+                n++;
+            }
+        }
+        /* Trace httpdProcessRequest's call to the dir-finder
+         * (0x40460648) and its return.  This pins down what the lookup
+         * sees at request time. */
+        if (pc == 0x4045d440 || pc == 0x4045d444 || pc == 0x4045d448) {
+            static int n;
+            if (n < 30) {
+                /* Also read first 16 bytes of r1 (path) string. */
+                uint32_t r0v = acpu->env.regs[0];
+                uint32_t r1v = acpu->env.regs[1];
+                char path[32] = {0};
+                if (r1v) {
+                    cpu_physical_memory_read(r1v, path, sizeof(path) - 1);
+                    for (int i = 0; i < (int)sizeof(path) - 1; i++) {
+                        if ((uint8_t)path[i] < 0x20 || (uint8_t)path[i] >= 0x7f) {
+                            path[i] = 0; break;
+                        }
+                    }
+                }
+                fprintf(stderr,
+                    "[httpd-pr] pc=%#x r0=%#x r1=%#x \"%s\" r2=%#x\n",
+                    pc, r0v, r1v, path, acpu->env.regs[2]);
+                n++;
+            }
+        }
+        /* Trace value of *0x406906ac when it transitions to non-zero;
+         * once it's set, dump the httpd-server struct it points to so
+         * we can see whether the content list got populated. */
+        {
+            static uint32_t last_glob_val;
+            static int dumped_struct;
+            uint32_t v = 0;
+            cpu_physical_memory_read(0x406906ac, &v, 4);
+            if (v != last_glob_val) {
+                fprintf(stderr,
+                    "[httpd-glob-change] *(0x406906ac) = %#x  at n=%d  pc=%#x\n",
+                    v, leopard_pc_sample_n, pc);
+                last_glob_val = v;
+            }
+            /* Dump struct once after global is set + delay.
+             *
+             * Also: experimentally copy *(server+0xc) into server+0x108 so
+             * `_httpd_findContentDir`-style lookups (which read [r0, #0x108])
+             * find the populated dirroot tree.  Without this, the routes
+             * registered into *(server+0xc)+0x100 are unreachable. */
+            if (v && leopard_pc_sample_n >= 10000 && dumped_struct == 0) {
+                dumped_struct = 1;
+                uint32_t server_plus_c2 = 0;
+                cpu_physical_memory_read(v + 0xc, &server_plus_c2, 4);
+                if (server_plus_c2 >= 0x40000000 && server_plus_c2 < 0x42000000) {
+                    cpu_physical_memory_write(v + 0x108, &server_plus_c2, 4);
+                    fprintf(stderr,
+                        "[httpd-fix-link] *(server+0x108) := *(server+0xc) = %#x\n",
+                        server_plus_c2);
+                }
+                uint8_t blob[0x200];
+                cpu_physical_memory_read(v, blob, sizeof(blob));
+                fprintf(stderr, "[httpd-server-dump] @ %#x:\n", v);
+                for (int j = 0; j < (int)sizeof(blob); j += 16) {
+                    fprintf(stderr, "  +%03x:", j);
+                    for (int k = 0; k < 16; k++) {
+                        fprintf(stderr, " %02x", blob[j + k]);
+                    }
+                    fprintf(stderr, "\n");
+                }
+                /* Also dump *(server+0xc) + 0x100 which AddC inserts into. */
+                uint32_t server_plus_c;
+                memcpy(&server_plus_c, blob + 0xc, 4);
+                fprintf(stderr, "[httpd-dirroot] *(server+0xc) = %#x\n",
+                        server_plus_c);
+                if (server_plus_c >= 0x40000000 && server_plus_c < 0x42000000) {
+                    uint8_t b2[0x140];
+                    cpu_physical_memory_read(server_plus_c, b2, sizeof(b2));
+                    fprintf(stderr, "[httpd-dirroot-dump] @ %#x:\n", server_plus_c);
+                    for (int j = 0; j < (int)sizeof(b2); j += 16) {
+                        fprintf(stderr, "  +%03x:", j);
+                        for (int k = 0; k < 16; k++) {
+                            fprintf(stderr, " %02x", b2[j + k]);
+                        }
+                        fprintf(stderr, "\n");
+                    }
+                    /* Walk +0x100 list head: pointer to first dir entry. */
+                    uint32_t list_head;
+                    memcpy(&list_head, b2 + 0x100, 4);
+                    fprintf(stderr, "[httpd-dirroot] +0x100 (dir list head) = %#x\n",
+                            list_head);
+                    if (list_head >= 0x40000000 && list_head < 0x42000000) {
+                        uint8_t b3[0x214];
+                        cpu_physical_memory_read(list_head, b3, sizeof(b3));
+                        fprintf(stderr, "[dir-entry-dump] @ %#x:\n", list_head);
+                        for (int j = 0; j < (int)sizeof(b3); j += 16) {
+                            fprintf(stderr, "  +%03x:", j);
+                            for (int k = 0; k < 16; k++) {
+                                fprintf(stderr, " %02x", b3[j + k]);
+                            }
+                            fprintf(stderr, "\n");
+                        }
+                        uint32_t handler_list;
+                        memcpy(&handler_list, b3 + 0x108, 4);
+                        fprintf(stderr, "[dir-entry] +0x108 (handler list) = %#x\n",
+                                handler_list);
+                    }
+                }
+                /* Try walking pointer-list fields at offsets 0..0x1fc. */
+                for (int o = 0; o < 0x200; o += 4) {
+                    uint32_t p;
+                    memcpy(&p, blob + o, 4);
+                    if (p >= 0x40400000 && p < 0x40700000) {
+                        char nm[32] = {0};
+                        cpu_physical_memory_read(p, nm, sizeof(nm) - 1);
+                        int printable = 1;
+                        for (int k = 0; k < 8 && nm[k]; k++) {
+                            if ((uint8_t)nm[k] < 0x20 ||
+                                (uint8_t)nm[k] >= 0x7f) {
+                                printable = 0; break;
+                            }
+                        }
+                        if (printable && nm[0]) {
+                            fprintf(stderr, "  +%03x -> %#x = \"%s\"\n",
+                                    o, p, nm);
+                        }
+                    }
+                }
+            }
+        }
+        /* BLOB-TRACER: capture PC whenever execution is outside the host
+         * RTOS code range (0x40205000 .. 0x40849510).  The first few
+         * captures of LR show the host-side BL into the WiFi/mt7626
+         * relocated driver blob, which is the surgical NOP target. */
+        if (getenv("LEOPARD_BLOB_TRACE")) {
+            static int blob_n;
+            if (blob_n < 80 &&
+                !(pc >= 0x40205000 && pc < 0x40850000) &&
+                !(pc >= 0x40000000 && pc < 0x40005000)) {
+                fprintf(stderr,
+                    "[blob] pc=%#x lr=%#x sp=%#x r0=%#x r1=%#x r2=%#x r3=%#x\n",
+                    pc, lr, sp,
+                    acpu->env.regs[0], acpu->env.regs[1],
+                    acpu->env.regs[2], acpu->env.regs[3]);
+                blob_n++;
+            }
+        }
+        /* APP-LIST SURGERY (opt-in via LEOPARD_SKIP_WIFI_APPS=1):
+         * skip systool + wlan, whose start handlers dive into the
+         * relocated WiFi/mt7626 driver blob and hang (WiFi MCU hardware
+         * isn't modeled).  Splice forward.next past systool(0x40732358)
+         * and wlan(0x407327c0) to wan(0x40731ef0).  Lets the orchestrator
+         * advance through every other AppStart + Phase 1/2, but at the
+         * cost of TCP-protocol registration that systool/wlan's
+         * non-WiFi parts normally do — incoming SYNs end up at the
+         * default IPv4 proto handler (0x40519040) instead of TCP
+         * (0x4057a574), so HTTP is unreachable.  Off by default until
+         * the missing TCP-registration call is replicated separately.
+         * See notes/WIFI_BYPASS_INVESTIGATION.md. */
+        {
+            static int patched_skip_wifi;
+            static int skip_enabled = -1;
+            if (skip_enabled < 0) {
+                const char *e = getenv("LEOPARD_SKIP_WIFI_APPS");
+                skip_enabled = (e && e[0] && e[0] != '0') ? 1 : 0;
+            }
+            if (skip_enabled && !patched_skip_wifi) {
+                uint32_t v = 0;
+                cpu_physical_memory_read(0x40732c28, &v, 4);
+                if (v == 0x40732358) {
+                    uint32_t newv = 0x40731ef0;
+                    cpu_physical_memory_write(0x40732c28, &newv, 4);
+                    fprintf(stderr,
+                        "[applist-surgery] forward.next: %#x -> %#x (skip systool+wlan)\n",
+                        v, newv);
+                    patched_skip_wifi = 1;
+                }
+            }
+        }
         /* Watch for entry into lanStart / ifconfig_exec. The sampler is
          * coarse-grained (1 ms below) so we only catch them if they
          * loop or block. Also catch by observing LR pointing back into
@@ -700,15 +957,74 @@ static void leopard_pc_sample_cb(void *opaque)
          * scripts/patch_inject_lan_ip.py. The stub fires from a real
          * task context inside the PPE-add function, where the lazy
          * semaphore in ifconfig_exec can be safely created.) */
-        if (pc == 0x403bcf98) {
-            static int n; if (++n <= 30)
-                fprintf(stderr, "[watch] ppe_add hit #%d r0=%#x lr=%#x sp=%#x\n",
-                        n, acpu->env.regs[0], lr, sp);
+        /* Catch the IO setup writes (run once per op) to learn the
+         * MMIO base. After 0x403bf710 (str r2, [r3, #0x718]) we know
+         * r3 holds the device struct base. */
+        if (pc == 0x403bf710) {
+            static int n; if (++n <= 8) {
+                uint32_t base = acpu->env.regs[3];
+                fprintf(stderr,
+                    "[watch] flash IO setup #%d: r3=%#x  (poll@%#x+0x718)\n",
+                    n, base, base);
+            }
         }
-        if (pc >= 0x405b5800 && pc < 0x405b5848) {
-            static int n; if (++n <= 30)
-                fprintf(stderr, "[watch] stub pc=%#x lr=%#x sp=%#x\n",
-                        pc, lr, sp);
+        if (pc >= 0x403fe71c && pc < 0x403fe7f0) {
+            static int n;
+            if (++n <= 40) {
+                uint32_t req = acpu->env.regs[4];
+                uint32_t url = req ? leopard_debug_read32(req + 0x50) : 0;
+                uint32_t status = req ? leopard_debug_read32(req + 0x10) : 0;
+                uint32_t typ = req ? (leopard_debug_read32(req + 0x14) & 0xff) : 0;
+                uint8_t host[65] = { 0 };
+                if (url) {
+                    address_space_read(&address_space_memory, url,
+                                       MEMTXATTRS_UNSPECIFIED, host,
+                                       sizeof(host) - 1);
+                    for (int i = 0; i < (int)sizeof(host) - 1; i++) {
+                        if (host[i] < 0x20 || host[i] > 0x7e) {
+                            host[i] = 0;
+                            break;
+                        }
+                    }
+                }
+                fprintf(stderr,
+                        "[http-guard] pc=%#x lr=%#x r0=%#x req=%#x "
+                        "type=%u status=%#x url=%#x '%s'\n",
+                        pc, lr, acpu->env.regs[0], req, typ, status, url,
+                        host);
+            }
+        }
+        if (pc == 0x403ff224 || pc == 0x403ff228 || pc == 0x403ff268) {
+            static int n;
+            if (++n <= 40) {
+                uint32_t req = acpu->env.regs[4];
+                uint32_t url = req ? leopard_debug_read32(req + 0x50) : 0;
+                uint32_t status = req ? leopard_debug_read32(req + 0x10) : 0;
+                uint32_t typ = req ? (leopard_debug_read32(req + 0x14) & 0xff) : 0;
+                fprintf(stderr,
+                        "[http-status-gate] pc=%#x lr=%#x guard_r0=%#x "
+                        "req=%#x type=%u status=%#x url=%#x\n",
+                        pc, lr, acpu->env.regs[0], req, typ, status, url);
+            }
+        }
+        if (pc == 0x403ff5c0 || pc == 0x403ff5c8 || pc == 0x403ff5fc ||
+            pc == 0x403ffce4) {
+            static int n;
+            if (++n <= 80) {
+                uint32_t req = acpu->env.regs[4];
+                uint32_t cls = req ? leopard_debug_read32(req + 0x0c) : 0;
+                uint32_t status = req ? leopard_debug_read32(req + 0x10) : 0;
+                uint32_t table = 0x40666694;
+                fprintf(stderr,
+                        "[http-class] pc=%#x lr=%#x req=%#x cls=%#x "
+                        "status=%#x tbl0.en=%#x tbl0.lport=%#x "
+                        "tbl1.en=%#x tbl1.lport=%#x\n",
+                        pc, lr, req, cls, status,
+                        leopard_debug_read32(table + 0x4c),
+                        leopard_debug_read32(table + 0x48),
+                        leopard_debug_read32(table + 0x98),
+                        leopard_debug_read32(table + 0x94));
+            }
         }
     }
     int64_t ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
@@ -737,7 +1053,7 @@ static void leopard_io_kick_cb(void *opaque)
  * the MTK PDMA layout (4x32-bit words per descriptor, stride 0x10).
  * --------------------------------------------------------------------*/
 #define LEOPARD_FE_BASE        0x1B100000
-#define LEOPARD_FE_SIZE        0x1000
+#define LEOPARD_FE_SIZE        0x6000
 #define LEOPARD_FE_IRQ         223  /* firmware passes INTID 0xff = SPI 223 */
 
 #define FE_GDMA1_FWD_CFG       0x500
@@ -779,6 +1095,8 @@ struct LeopardFEState {
     uint32_t gdma1_fwd_cfg;
     uint32_t mac_h;
     uint32_t mac_l;
+    uint8_t  peer_mac[6];
+    bool     peer_mac_valid;
 
     uint32_t rx_base;
     uint32_t rx_max;
@@ -817,7 +1135,52 @@ struct LeopardFEState {
      * Track value-writes per offset so reads see what the driver
      * stored. */
     uint32_t fe_misc[0x1000 / 4];
+
+    /* Synthetic-TX dedup ring.
+     *
+     * The firmware-side patches (patch_synthetic_fe_tx_mbuf,
+     * patch_mirror_ipv4_output_mbuf) hook the FE driver's mbuf-free
+     * wrapper.  Real hardware transmits each packet once (one TX
+     * descriptor per packet), but the wrapper is called multiple
+     * times per logical packet in this firmware (the mbuf passes
+     * through a per-stage chain: link layer free, L3 free, etc., and
+     * each stage hits the wrapper).  Without dedup we emit the same
+     * frame 3-4 times into slirp; the host stack sees the duplicates
+     * but slirp/lwIP-style flow accounting on the firmware side reacts
+     * to the implied dup-ACKs / unexpected retransmits, and the TCP
+     * sender stalls or closes after one socket-buffer's worth of data
+     * (16 KiB) has been "transmitted".
+     *
+     * We dedup by FNV-1a hash of the entire frame content (folded with
+     * the frame length) over a small ring of recently emitted frames.
+     * Different segments necessarily differ in TCP seq / payload, so
+     * legitimate packets are never collapsed; identical re-emissions
+     * within the ring window are dropped before reaching slirp. */
+#define LEOPARD_TX_DEDUP_RING 32
+    uint64_t tx_dedup_ring[LEOPARD_TX_DEDUP_RING];
+    uint32_t tx_dedup_idx;
 };
+
+static bool leopard_fe_tx_dedup(LeopardFEState *s,
+                                const uint8_t *buf, size_t len)
+{
+    uint64_t h = 0xcbf29ce484222325ULL;       /* FNV-1a 64-bit offset */
+    for (size_t i = 0; i < len; i++) {
+        h ^= buf[i];
+        h *= 0x100000001b3ULL;
+    }
+    /* Fold length to distinguish prefix-equal frames of different sizes. */
+    h ^= (uint64_t)len << 1;
+
+    for (int i = 0; i < LEOPARD_TX_DEDUP_RING; i++) {
+        if (s->tx_dedup_ring[i] == h) {
+            return true;
+        }
+    }
+    s->tx_dedup_ring[s->tx_dedup_idx] = h;
+    s->tx_dedup_idx = (s->tx_dedup_idx + 1) % LEOPARD_TX_DEDUP_RING;
+    return false;
+}
 
 static void leopard_fe_update_irq(LeopardFEState *s)
 {
@@ -835,6 +1198,200 @@ static hwaddr leopard_fe_dma_addr(uint32_t reg)
     /* Firmware writes (phys & 0x1fffffff) | 0x40000000. Strip flag bits
      * and OR back DRAM base. */
     return ((hwaddr)(reg & 0x1fffffffu)) | LEOPARD_DRAM_BASE;
+}
+
+static uint32_t leopard_debug_read32(uint32_t addr)
+{
+    uint32_t v = 0;
+    address_space_read(&address_space_memory, addr, MEMTXATTRS_UNSPECIFIED,
+                       &v, sizeof(v));
+    return le32_to_cpu(v);
+}
+
+static void leopard_debug_write32(uint32_t addr, uint32_t val)
+{
+    uint32_t v = cpu_to_le32(val);
+    address_space_write(&address_space_memory, addr, MEMTXATTRS_UNSPECIFIED,
+                        &v, sizeof(v));
+}
+
+static hwaddr leopard_dram_ptr(uint32_t p)
+{
+    if (p >= LEOPARD_DRAM_BASE && p < LEOPARD_DRAM_BASE + LEOPARD_DRAM_SIZE) {
+        return p;
+    }
+    return leopard_fe_dma_addr(p);
+}
+
+static void leopard_fe_get_fw_mac(LeopardFEState *s, uint8_t fw_mac[6])
+{
+    uint32_t adrh = s->mac_l;
+    uint32_t adrl = s->mac_h;
+
+    fw_mac[0] = (adrh >> 8) & 0xff;
+    fw_mac[1] = (adrh >> 0) & 0xff;
+    fw_mac[2] = (adrl >> 24) & 0xff;
+    fw_mac[3] = (adrl >> 16) & 0xff;
+    fw_mac[4] = (adrl >> 8) & 0xff;
+    fw_mac[5] = (adrl >> 0) & 0xff;
+}
+
+static uint16_t leopard_get_be16(const uint8_t *p)
+{
+    return ((uint16_t)p[0] << 8) | p[1];
+}
+
+static uint32_t leopard_get_be32(const uint8_t *p)
+{
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) | p[3];
+}
+
+static uint16_t leopard_fold_checksum(uint32_t sum)
+{
+    while (sum >> 16) {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    return ~sum;
+}
+
+static uint16_t leopard_ip_checksum(const uint8_t *ip, size_t ihl)
+{
+    uint32_t sum = 0;
+    for (size_t i = 0; i + 1 < ihl; i += 2) {
+        if (i == 10) {
+            continue;
+        }
+        sum += leopard_get_be16(ip + i);
+    }
+    return leopard_fold_checksum(sum);
+}
+
+static uint16_t leopard_tcp_checksum(const uint8_t *ip, size_t ip_len)
+{
+    uint8_t ihl = (ip[0] & 0x0f) * 4;
+    uint16_t tcp_len;
+    uint32_t sum = 0;
+
+    if (ip_len < ihl || ip[9] != 6) {
+        return 0;
+    }
+    tcp_len = ip_len - ihl;
+    for (int i = 12; i < 20; i += 2) {
+        sum += leopard_get_be16(ip + i);
+    }
+    sum += ip[9];
+    sum += tcp_len;
+    for (uint16_t i = 0; i < tcp_len; i += 2) {
+        if (i == 16) {
+            continue;
+        }
+        if (i + 1 < tcp_len) {
+            sum += leopard_get_be16(ip + ihl + i);
+        } else {
+            sum += (uint16_t)ip[ihl + i] << 8;
+        }
+    }
+    return leopard_fold_checksum(sum);
+}
+
+static void leopard_fix_ipv4_checksums(uint8_t *ip, size_t len)
+{
+    uint8_t ihl;
+    uint16_t csum;
+
+    if (len < 20 || (ip[0] >> 4) != 4) {
+        return;
+    }
+    ihl = (ip[0] & 0x0f) * 4;
+    if (ihl < 20 || len < ihl) {
+        return;
+    }
+    ip[10] = 0;
+    ip[11] = 0;
+    csum = leopard_ip_checksum(ip, ihl);
+    ip[10] = csum >> 8;
+    ip[11] = csum & 0xff;
+    if (ip[9] == 6 && len >= ihl + 20) {
+        uint8_t *tcp = ip + ihl;
+        tcp[16] = 0;
+        tcp[17] = 0;
+        csum = leopard_tcp_checksum(ip, len);
+        tcp[16] = csum >> 8;
+        tcp[17] = csum & 0xff;
+    }
+}
+
+static void leopard_fe_ensure_ipv4_binding(void)
+{
+    enum {
+        FAKE_IF_ROOT = 0x405b5a80,
+        FAKE_ADDR_NODE = 0x405b5b00,
+        FAKE_SOCKADDR = 0x405b5b80,
+    };
+    uint32_t cfg = leopard_debug_read32(0x4071e6c0);
+    /*
+     * The web stack independently classifies accepted sockets as local
+     * vs remote management by testing the peer address against this LAN
+     * address global and the firmware's mask at 0x40689490.  The target
+     * image's default management subnet is 192.168.0.0/24.  Do not write
+     * 0x40689490 here; in the ARP path it is also used as a callback/list
+     * slot, and poisoning it with a netmask crashes tNetTask.
+     */
+    leopard_debug_write32(0x40689488, 0x0100a8c0);
+    if (!cfg || leopard_debug_read32(cfg + 0x18)) {
+        leopard_debug_write32(0x4066bb28, 0);
+        return;
+    }
+
+    /*
+     * IP input walks (*(cfg+0x18)+0x10) as an in_ifaddr-style list:
+     *   node[0]   -> sockaddr, byte 1 is AF_INET (2)
+     *   node[2]   must be non-zero
+     *   sockaddr+4 holds the IPv4 address as a host-endian u32
+     *   node[0x18] is the next pointer
+     * Populate only those fields so the real IP/TCP path sees
+     * 192.168.0.1 as a local address.
+     */
+    leopard_debug_write32(cfg + 0x18, FAKE_IF_ROOT);
+    leopard_debug_write32(FAKE_IF_ROOT + 0x10, FAKE_ADDR_NODE);
+    leopard_debug_write32(FAKE_IF_ROOT + 0x2c, 0);
+    leopard_debug_write32(FAKE_ADDR_NODE + 0x00, FAKE_SOCKADDR);
+    leopard_debug_write32(FAKE_ADDR_NODE + 0x08, 1);
+    leopard_debug_write32(FAKE_ADDR_NODE + 0x60, 0);
+    leopard_debug_write32(FAKE_SOCKADDR + 0x00, 0x00000200);
+    leopard_debug_write32(FAKE_SOCKADDR + 0x04, 0x0100a8c0);
+    leopard_debug_write32(0x4066bb28, 0);
+    fprintf(stderr,
+            "[ip-bind] synthesized AF_INET 192.168.0.1 root=%#x node=%#x\n",
+            FAKE_IF_ROOT, FAKE_ADDR_NODE);
+}
+
+static void leopard_fe_dump_ipv4_bindings(void)
+{
+    uint32_t cfg = leopard_debug_read32(0x4071e6c0);
+    uint32_t if_root = cfg ? leopard_debug_read32(cfg + 0x18) : 0;
+    uint32_t addr_node = if_root ? leopard_debug_read32(if_root + 0x10) : 0;
+
+    fprintf(stderr,
+            "[ip-bind] *4071e6c0=%#x if_root=%#x addr_list=%#x\n",
+            cfg, if_root, addr_node);
+
+    for (int i = 0; addr_node && i < 12; i++) {
+        uint32_t sockaddr = leopard_debug_read32(addr_node + 0x00);
+        uint32_t ifp = leopard_debug_read32(addr_node + 0x08);
+        uint32_t next = leopard_debug_read32(addr_node + 0x60);
+        uint32_t family_word = sockaddr ? leopard_debug_read32(sockaddr) : 0;
+        uint32_t ip = sockaddr ? leopard_debug_read32(sockaddr + 0x04) : 0;
+
+        fprintf(stderr,
+                "[ip-bind] node[%d]=%#x sockaddr=%#x family_word=%#x "
+                "ip=%u.%u.%u.%u raw=%#x ifp=%#x next=%#x\n",
+                i, addr_node, sockaddr, family_word,
+                ip & 0xff, (ip >> 8) & 0xff, (ip >> 16) & 0xff,
+                (ip >> 24) & 0xff, ip, ifp, next);
+        addr_node = next;
+    }
 }
 
 /* Read a 16-byte PDMA descriptor (4 LE words). */
@@ -938,6 +1495,37 @@ static ssize_t leopard_fe_receive(NetClientState *nc,
         }
         fprintf(stderr, "\n");
     }
+    if (size >= 54 && buf[12] == 0x08 && buf[13] == 0x00 &&
+        (buf[14] >> 4) == 4 && buf[23] == 6) {
+        const uint8_t *ip = buf + 14;
+        uint8_t ihl = (ip[0] & 0x0f) * 4;
+        if (ihl >= 20 && size >= 14 + ihl + 20) {
+            const uint8_t *tcp = ip + ihl;
+            uint16_t ip_len = leopard_get_be16(ip + 2);
+            uint8_t thl = (tcp[12] >> 4) * 4;
+            uint16_t data_len = ip_len >= ihl + thl ? ip_len - ihl - thl : 0;
+            fprintf(stderr,
+                    "[fe] RX tcp %u.%u.%u.%u>%u.%u.%u.%u %u>%u "
+                    "flags=%#x seq=%#x ack=%#x win=%u iplen=%u datalen=%u\n",
+                    buf[26], buf[27], buf[28], buf[29],
+                    buf[30], buf[31], buf[32], buf[33],
+                    leopard_get_be16(tcp), leopard_get_be16(tcp + 2),
+                    tcp[13], leopard_get_be32(tcp + 4),
+                    leopard_get_be32(tcp + 8), leopard_get_be16(tcp + 14),
+                    ip_len, data_len);
+        }
+    }
+    if (size >= 34 && buf[12] == 0x08 && buf[13] == 0x00 &&
+        buf[23] == 0x06) {
+        memcpy(s->peer_mac, buf + 6, 6);
+        s->peer_mac_valid = true;
+        static bool dumped_ipv4_bindings;
+        if (!dumped_ipv4_bindings) {
+            dumped_ipv4_bindings = true;
+            leopard_fe_ensure_ipv4_binding();
+            leopard_fe_dump_ipv4_bindings();
+        }
+    }
     /* ARP auto-reply: the firmware's IP layer doesn't actually have an
      * IP assigned (or the bridge<->IP-stack glue is incomplete in our
      * synthetic build), so it never replies to ARP requests for its
@@ -946,7 +1534,7 @@ static ssize_t leopard_fe_receive(NetClientState *nc,
      * SYN to the firmware's MAC, and host->guest TCP times out.
      *
      * Stand in for the firmware's ARP layer: when we see an ARP
-     * request for 192.168.1.1, generate the reply ourselves and
+     * request for 192.168.0.1, generate the reply ourselves and
      * inject it back via the NIC's TX queue.  This is the same kind
      * of "fake what the firmware should be doing" that we already do
      * for PHY/MDIO.
@@ -967,7 +1555,7 @@ static ssize_t leopard_fe_receive(NetClientState *nc,
     if (size >= 42 && buf[12] == 0x08 && buf[13] == 0x06 &&
         buf[20] == 0x00 && buf[21] == 0x01) {
         /* ARP request.  Target IP at bytes 38..41. */
-        uint32_t our_ip = (192u<<24) | (168u<<16) | (1u<<8) | 1u;
+        uint32_t our_ip = (192u<<24) | (168u<<16) | (0u<<8) | 1u;
         uint32_t tgt_ip = ((uint32_t)buf[38]<<24) | ((uint32_t)buf[39]<<16) |
                           ((uint32_t)buf[40]<<8)  | (uint32_t)buf[41];
         if (tgt_ip == our_ip) {
@@ -981,15 +1569,8 @@ static ssize_t leopard_fe_receive(NetClientState *nc,
              * Our register names are swapped vs the firmware: s->mac_h
              * holds what the firmware calls ADRL (low 4 bytes), and
              * s->mac_l holds ADRH (high 2 bytes). */
-            uint32_t adrh = s->mac_l;
-            uint32_t adrl = s->mac_h;
             uint8_t fw_mac[6];
-            fw_mac[0] = (adrh >> 8) & 0xff;
-            fw_mac[1] = (adrh >> 0) & 0xff;
-            fw_mac[2] = (adrl >> 24) & 0xff;
-            fw_mac[3] = (adrl >> 16) & 0xff;
-            fw_mac[4] = (adrl >> 8) & 0xff;
-            fw_mac[5] = (adrl >> 0) & 0xff;
+            leopard_fe_get_fw_mac(s, fw_mac);
             /* dst = sender of request */
             memcpy(reply + 0, buf + 6, 6);
             memcpy(reply + 6, fw_mac, 6);
@@ -999,22 +1580,15 @@ static ssize_t leopard_fe_receive(NetClientState *nc,
             reply[18] = 6; reply[19] = 4;
             reply[20] = 0x00; reply[21] = 0x02;       /* reply */
             memcpy(reply + 22, fw_mac, 6);
-            reply[26] = 192; reply[27] = 168; reply[28] = 1; reply[29] = 1;
+            reply[28] = 192; reply[29] = 168; reply[30] = 0; reply[31] = 1;
             memcpy(reply + 32, buf + 22, 6);          /* tgt HW = orig sender HW */
             memcpy(reply + 38, buf + 28, 4);          /* tgt IP = orig sender IP */
-            fprintf(stderr, "[fe] ARP auto-reply: %02x:%02x:%02x:%02x:%02x:%02x is 192.168.1.1\n",
+            fprintf(stderr, "[fe] ARP auto-reply: %02x:%02x:%02x:%02x:%02x:%02x is 192.168.0.1\n",
                     fw_mac[0], fw_mac[1], fw_mac[2], fw_mac[3], fw_mac[4], fw_mac[5]);
-            /* Try both: direct send AND deferred send.  Slirp may
-             * filter re-entrant sends; the deferred path catches that. */
             qemu_send_packet(qemu_get_queue(s->nic), reply, sizeof(reply));
-            memcpy(leopard_arp_reply, reply, sizeof(reply));
-            leopard_arp_nic = s->nic;
-            timer_mod(leopard_arp_send_timer,
-                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100000);
-            return size;  /* swallow the request */
+            return size;
         }
     }
-
     if (!(s->glo_cfg & 4)) return 0;
     if (!s->rx_base || !s->rx_max) return 0;
     if (size > 1600) return size;        /* drop oversize */
@@ -1089,6 +1663,9 @@ static ssize_t leopard_fe_receive(NetClientState *nc,
 static uint64_t leopard_fe_read(void *opaque, hwaddr off, unsigned size)
 {
     LeopardFEState *s = opaque;
+    if (off >= 0x5000 && off < 0x6000) {
+        off -= 0x5000;
+    }
     switch (off) {
     case FE_GDMA1_FWD_CFG:    return s->gdma1_fwd_cfg;
     case FE_GMAC1_MAC_ADRH:   return s->mac_h;
@@ -1132,6 +1709,9 @@ static void leopard_fe_write(void *opaque, hwaddr off,
                              uint64_t val, unsigned size)
 {
     LeopardFEState *s = opaque;
+    if (off >= 0x5000 && off < 0x6000) {
+        off -= 0x5000;
+    }
     switch (off) {
     case FE_GDMA1_FWD_CFG: s->gdma1_fwd_cfg = val; break;
     case FE_GMAC1_MAC_ADRH: s->mac_h = val; break;
@@ -1212,6 +1792,287 @@ static void leopard_fe_write(void *opaque, hwaddr off,
          * polls some PPE bits and stalls if they're stuck at 0). */
         unsigned o = (unsigned)off & 0xfff;
         s->fe_misc[o >> 2] = (uint32_t)val;
+        if (o == 0xfc8) {
+            uint32_t mbuf = (uint32_t)val;
+            uint32_t len = leopard_debug_read32(mbuf + 0x08);
+            uint32_t data_ptr = leopard_debug_read32(mbuf + 0x0c);
+            if (len && len <= 1600 && data_ptr) {
+                uint8_t buf[1600];
+                uint32_t send_len = len;
+                hwaddr ba = leopard_dram_ptr(data_ptr);
+                address_space_read(&address_space_memory, ba,
+                                   MEMTXATTRS_UNSPECIFIED, buf, len);
+                if (len >= 34 && buf[12] == 0x08 && buf[13] == 0x00) {
+                    uint16_t ip_len = leopard_get_be16(buf + 16);
+                    uint32_t frame_len = 14 + ip_len;
+                    if (frame_len > len && frame_len <= sizeof(buf)) {
+                        send_len = frame_len;
+                        address_space_read(&address_space_memory, ba,
+                                           MEMTXATTRS_UNSPECIFIED, buf,
+                                           send_len);
+                    }
+                }
+                if (len >= 42 && buf[12] == 0x08 && buf[13] == 0x06) {
+                    uint8_t fw_mac[6];
+                    leopard_fe_get_fw_mac(s, fw_mac);
+                    memcpy(buf + 6, fw_mac, 6);
+                    memcpy(buf + 22, fw_mac, 6);
+                } else if (send_len >= 34 && buf[12] == 0x08 && buf[13] == 0x00) {
+                    uint8_t fw_mac[6];
+                    leopard_fe_get_fw_mac(s, fw_mac);
+                    memcpy(buf + 6, fw_mac, 6);
+                    leopard_fix_ipv4_checksums(buf + 14, send_len - 14);
+                }
+                if (send_len >= 54 && buf[12] == 0x08 && buf[13] == 0x00 &&
+                    buf[14] == 0x45 && buf[23] == 6) {
+                    const uint8_t *ip = buf + 14;
+                    const uint8_t *tcp = ip + ((ip[0] & 0x0f) * 4);
+                    uint16_t ip_len = leopard_get_be16(ip + 2);
+                    fprintf(stderr,
+                            "[fe] synthetic TX mbuf=%#x len=%u/%u data=%#x "
+                            "%02x:%02x:%02x:%02x:%02x:%02x -> "
+                            "%02x:%02x:%02x:%02x:%02x:%02x type=0800 "
+                            "ip=%u.%u.%u.%u>%u.%u.%u.%u tcp=%u>%u "
+                            "flags=%#x seq=%#x ack=%#x iplen=%u datalen=%u\n",
+                            mbuf, len, send_len, data_ptr,
+                            buf[6], buf[7], buf[8], buf[9], buf[10], buf[11],
+                            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5],
+                            buf[26], buf[27], buf[28], buf[29],
+                            buf[30], buf[31], buf[32], buf[33],
+                            leopard_get_be16(tcp), leopard_get_be16(tcp + 2),
+                            tcp[13], leopard_get_be32(tcp + 4),
+                            leopard_get_be32(tcp + 8), ip_len,
+                            ip_len >= (uint16_t)(((ip[0] & 0x0f) * 4) + ((tcp[12] >> 4) * 4)) ?
+                            ip_len - ((ip[0] & 0x0f) * 4) - ((tcp[12] >> 4) * 4) : 0);
+                    if (tcp[13] & 0x04) {
+                        fprintf(stderr, "[fe] synthetic TX drop TCP RST\n");
+                        goto synthetic_tx_done;
+                    }
+                } else {
+                    fprintf(stderr, "[fe] synthetic TX mbuf=%#x len=%u/%u data=%#x "
+                            "%02x:%02x:%02x:%02x:%02x:%02x -> "
+                            "%02x:%02x:%02x:%02x:%02x:%02x type=%02x%02x\n",
+                            mbuf, len, send_len, data_ptr,
+                            buf[6], buf[7], buf[8], buf[9], buf[10], buf[11],
+                            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5],
+                            buf[12], buf[13]);
+                }
+                if (leopard_fe_tx_dedup(s, buf, send_len)) {
+                    fprintf(stderr,
+                            "[fe] synthetic TX dedup mbuf=%#x data=%#x len=%u\n",
+                            mbuf, data_ptr, send_len);
+                } else if (s->nic) {
+                    qemu_send_packet(qemu_get_queue(s->nic), buf, send_len);
+                }
+synthetic_tx_done:
+                ;
+            } else {
+                fprintf(stderr, "[fe] synthetic TX skip mbuf=%#x len=%u data=%#x\n",
+                        mbuf, len, data_ptr);
+            }
+        }
+        if (o == 0xfcc) {
+            uint32_t mbuf = (uint32_t)val;
+            uint32_t len = leopard_debug_read32(mbuf + 0x08);
+            uint32_t data_ptr = leopard_debug_read32(mbuf + 0x0c);
+            if (len && len <= 1500 && data_ptr && s->peer_mac_valid) {
+                uint8_t frame[1514];
+                uint8_t fw_mac[6];
+                hwaddr ba = leopard_dram_ptr(data_ptr);
+
+                leopard_fe_get_fw_mac(s, fw_mac);
+                memcpy(frame, s->peer_mac, 6);
+                memcpy(frame + 6, fw_mac, 6);
+                frame[12] = 0x08;
+                frame[13] = 0x00;
+                address_space_read(&address_space_memory, ba,
+                                   MEMTXATTRS_UNSPECIFIED, frame + 14, len);
+                leopard_fix_ipv4_checksums(frame + 14, len);
+                if (len >= 20 && frame[14] == 0x45 && frame[23] == 6) {
+                    const uint8_t *ip = frame + 14;
+                    const uint8_t *tcp = ip + ((ip[0] & 0x0f) * 4);
+                    uint16_t ip_sum = leopard_ip_checksum(ip, (ip[0] & 0x0f) * 4);
+                    uint16_t tcp_sum = leopard_tcp_checksum(ip, len);
+                    fprintf(stderr,
+                            "[fe] synthetic L3 TX mbuf=%#x len=%u data=%#x "
+                            "%02x:%02x:%02x:%02x:%02x:%02x -> "
+                            "%02x:%02x:%02x:%02x:%02x:%02x "
+                            "ip=%u.%u.%u.%u>%u.%u.%u.%u proto=6 "
+                            "tcp=%u>%u flags=%#x seq=%#x ack=%#x "
+                            "win=%u csum=%#x/%#x ipcsum=%#x/%#x\n",
+                            mbuf, len, data_ptr,
+                            frame[6], frame[7], frame[8], frame[9], frame[10], frame[11],
+                            frame[0], frame[1], frame[2], frame[3], frame[4], frame[5],
+                            frame[26], frame[27], frame[28], frame[29],
+                            frame[30], frame[31], frame[32], frame[33],
+                            leopard_get_be16(tcp), leopard_get_be16(tcp + 2),
+                            tcp[13], leopard_get_be32(tcp + 4),
+                            leopard_get_be32(tcp + 8), leopard_get_be16(tcp + 14),
+                            leopard_get_be16(tcp + 16), tcp_sum,
+                            leopard_get_be16(ip + 10), ip_sum);
+                } else {
+                    fprintf(stderr, "[fe] synthetic L3 TX mbuf=%#x len=%u data=%#x "
+                            "%02x:%02x:%02x:%02x:%02x:%02x -> "
+                            "%02x:%02x:%02x:%02x:%02x:%02x ip=%u.%u.%u.%u>%u.%u.%u.%u proto=%u\n",
+                            mbuf, len, data_ptr,
+                            frame[6], frame[7], frame[8], frame[9], frame[10], frame[11],
+                            frame[0], frame[1], frame[2], frame[3], frame[4], frame[5],
+                            frame[26], frame[27], frame[28], frame[29],
+                            frame[30], frame[31], frame[32], frame[33], frame[23]);
+                }
+                if (leopard_fe_tx_dedup(s, frame, len + 14)) {
+                    fprintf(stderr,
+                            "[fe] synthetic L3 TX dedup mbuf=%#x data=%#x len=%u\n",
+                            mbuf, data_ptr, len + 14);
+                } else if (s->nic) {
+                    qemu_send_packet(qemu_get_queue(s->nic), frame, len + 14);
+                }
+            } else {
+                fprintf(stderr, "[fe] synthetic L3 skip mbuf=%#x len=%u data=%#x peer=%d\n",
+                        mbuf, len, data_ptr, s->peer_mac_valid);
+            }
+        }
+        if (o == 0xfa0 || o == 0xfa4 || o == 0xfa8 || o == 0xfb0 ||
+            o == 0xfd0 || o == 0xfd4 || o == 0xfd8 || o == 0xfdc ||
+            o == 0xfe0 || o == 0xfe4 || o == 0xfe8 || o == 0xfec ||
+            o == 0xff0 || o == 0xff4 || o == 0xff8 || o == 0xffc) {
+            CPUState *cs = qemu_get_cpu(0);
+            ARMCPU *acpu = ARM_CPU(cs);
+            uint32_t pc = acpu ? acpu->env.regs[15] : 0;
+            uint32_t lr = acpu ? acpu->env.regs[14] : 0;
+            const char *trace_name;
+            switch (o) {
+            case 0xfa0:
+                trace_name = "dir_lookup_server";
+                break;
+            case 0xfa4:
+                trace_name = "dir_lookup_path";
+                {
+                    char path[40] = {0};
+                    cpu_physical_memory_read(val, path, sizeof(path) - 1);
+                    for (int i = 0; i < (int)sizeof(path) - 1; i++) {
+                        if ((uint8_t)path[i] < 0x20 || (uint8_t)path[i] >= 0x7f) {
+                            path[i] = 0; break;
+                        }
+                    }
+                    fprintf(stderr, "[fe-trace] dir_lookup_path = %#x \"%s\"\n",
+                            (unsigned)val, path);
+                }
+                break;
+            case 0xfb0:
+                trace_name = "send_chunk_ret";
+                break;
+            case 0xfa8:
+                trace_name = "dir_lookup_ret";
+                break;
+            case 0xfd0:
+                trace_name = "tcp_pcb_lookup";
+                break;
+            case 0xfd4:
+                trace_name = "httpd_autostart";
+                {
+                    uint32_t pre = 0;
+                    cpu_physical_memory_read(0x406906ac, &pre, 4);
+                    fprintf(stderr,
+                        "[httpd-glob] at autostart-trigger *(0x406906ac)=%#x\n",
+                        pre);
+                    static int dumped;
+                    if (!dumped) {
+                        dumped = 1;
+                        /* Dump app lifecycle list at 0x406a14f8 / 0x406a1500
+                         * to identify which AppStart hangs. */
+                        fprintf(stderr, "[applist] dumping context around 0x406a14e0..1520\n");
+                        for (uint32_t a = 0x406a14e0; a < 0x406a1530; a += 4) {
+                            uint32_t v = 0;
+                            cpu_physical_memory_read(a, &v, 4);
+                            fprintf(stderr, "  [%#010x] = %#010x\n", a, v);
+                        }
+                        for (int head_off = 0; head_off < 2; head_off++) {
+                            uint32_t head_addr = 0x406a14f8 + head_off * 8;
+                            uint32_t head = 0;
+                            cpu_physical_memory_read(head_addr, &head, 4);
+                            fprintf(stderr, "[applist] *%#x = %#x\n", head_addr, head);
+                            uint32_t cur = head;
+                            for (int i = 0; cur && i < 32; i++) {
+                                uint8_t blob[0x40];
+                                cpu_physical_memory_read(cur, blob, sizeof(blob));
+                                fprintf(stderr, "  app[%d] @ %#010x:\n", i, cur);
+                                for (int j = 0; j < (int)sizeof(blob); j += 16) {
+                                    fprintf(stderr, "    +%02x:", j);
+                                    for (int k = 0; k < 16; k++) {
+                                        fprintf(stderr, " %02x", blob[j + k]);
+                                    }
+                                    fprintf(stderr, "  ");
+                                    for (int k = 0; k < 16; k++) {
+                                        uint8_t c = blob[j + k];
+                                        fputc((c >= 0x20 && c < 0x7f) ? c : '.', stderr);
+                                    }
+                                    fprintf(stderr, "\n");
+                                }
+                                /* If the entry has a name pointer in any of the first
+                                 * 8 fields, try to print as string. */
+                                for (int f = 0; f < 8; f++) {
+                                    uint32_t p;
+                                    memcpy(&p, blob + f * 4, 4);
+                                    if (p >= 0x40400000 && p < 0x40700000) {
+                                        char nm[32] = {0};
+                                        cpu_physical_memory_read(p, nm, sizeof(nm) - 1);
+                                        int printable = 1;
+                                        for (int k = 0; k < 8 && nm[k]; k++) {
+                                            if ((uint8_t)nm[k] < 0x20 || (uint8_t)nm[k] >= 0x7f) {
+                                                printable = 0; break;
+                                            }
+                                        }
+                                        if (printable && nm[0]) {
+                                            fprintf(stderr, "    +%02x -> %#x = \"%s\"\n",
+                                                    f * 4, p, nm);
+                                        }
+                                    }
+                                }
+                                /* Assume linked list, next at offset 0. */
+                                uint32_t next;
+                                memcpy(&next, blob, 4);
+                                if (next == cur) break;
+                                cur = next;
+                            }
+                        }
+                    }
+                }
+                break;
+            case 0xfd8:
+                trace_name = "tcp_state";
+                break;
+            case 0xfdc:
+                trace_name = "tcp_marker";
+                break;
+            case 0xfe0:
+                trace_name = "ip_marker";
+                break;
+            case 0xfe4:
+                trace_name = "minifs_read_status";
+                break;
+            case 0xfe8:
+                trace_name = "minifs_read_len";
+                break;
+            case 0xfec:
+                trace_name = "minifs_read_meta";
+                break;
+            case 0xff0:
+                trace_name = "rx_ethertype";
+                break;
+            case 0xff4:
+                trace_name = "rx_dispatch_ret";
+                break;
+            case 0xff8:
+                trace_name = "rx_proto_handler";
+                break;
+            default:
+                trace_name = "rx_proto_ret";
+                break;
+            }
+            fprintf(stderr, "[fe-trace] %s = %#x  (pc=%#x lr=%#x)\n",
+                    trace_name, (unsigned)val, pc, lr);
+        }
         /* Log distinct offsets once each. */
         static uint8_t seen[0x1000];
         if (!seen[o]) {
