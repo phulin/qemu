@@ -2092,7 +2092,8 @@ synthetic_tx_done:
                         mbuf, len, data_ptr, s->peer_mac_valid);
             }
         }
-        if (o == 0xfa0 || o == 0xfa4 || o == 0xfa8 || o == 0xfb0 || o == 0xfb4 ||
+        if (o == 0xf80 || o == 0xf84 ||
+            o == 0xfa0 || o == 0xfa4 || o == 0xfa8 || o == 0xfb0 || o == 0xfb4 ||
             o == 0xfb8 || o == 0xfbc || o == 0xfc0 || o == 0xfc4 ||
             o == 0xfc8 || o == 0xfcc ||
             o == 0xfd0 || o == 0xfd4 || o == 0xfd8 || o == 0xfdc ||
@@ -2136,6 +2137,46 @@ synthetic_tx_done:
             case 0xfc0:
                 trace_name = "appstart_handler";
                 break;
+            case 0xf80: {
+                /* Hex+ASCII dump of 0x2c bytes at val (= buf_d4 base). */
+                uint8_t buf[0x2c] = {0};
+                if (val >= 0x40000000 && val < 0x42000000) {
+                    address_space_read(&address_space_memory, (hwaddr)val,
+                                       MEMTXATTRS_UNSPECIFIED, buf, sizeof(buf));
+                }
+                fprintf(stderr, "[fe-trace] buf_d4 @ %#x:\n", (unsigned)val);
+                for (int i = 0; i < (int)sizeof(buf); i += 16) {
+                    char hex[64], asc[20]; int p=0;
+                    for (int j = 0; j < 16 && i+j < (int)sizeof(buf); j++) {
+                        p += snprintf(hex+p, sizeof(hex)-p, "%02x ", buf[i+j]);
+                        asc[j] = (buf[i+j] >= 0x20 && buf[i+j] < 0x7f) ? buf[i+j] : '.';
+                    }
+                    asc[16] = 0;
+                    fprintf(stderr, "  +%02x: %-48s  %s\n", i, hex, asc);
+                }
+                trace_name = NULL;
+                break;
+            }
+            case 0xf84: {
+                /* Hex+ASCII dump of 0x48 bytes at val (= buf_a8 base). */
+                uint8_t buf[0x48] = {0};
+                if (val >= 0x40000000 && val < 0x42000000) {
+                    address_space_read(&address_space_memory, (hwaddr)val,
+                                       MEMTXATTRS_UNSPECIFIED, buf, sizeof(buf));
+                }
+                fprintf(stderr, "[fe-trace] buf_a8 @ %#x:\n", (unsigned)val);
+                for (int i = 0; i < (int)sizeof(buf); i += 16) {
+                    char hex[64], asc[20]; int p=0;
+                    for (int j = 0; j < 16 && i+j < (int)sizeof(buf); j++) {
+                        p += snprintf(hex+p, sizeof(hex)-p, "%02x ", buf[i+j]);
+                        asc[j] = (buf[i+j] >= 0x20 && buf[i+j] < 0x7f) ? buf[i+j] : '.';
+                    }
+                    asc[16] = 0;
+                    fprintf(stderr, "  +%02x: %-48s  %s\n", i, hex, asc);
+                }
+                trace_name = NULL;
+                break;
+            }
             case 0xfc8: {
                 /* string-pointer channel (raw, like 0xfc4 but no name). */
                 char buf[80] = {0};
