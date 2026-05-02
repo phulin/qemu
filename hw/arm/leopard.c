@@ -1932,7 +1932,8 @@ synthetic_tx_done:
                         mbuf, len, data_ptr, s->peer_mac_valid);
             }
         }
-        if (o == 0xfa0 || o == 0xfa4 || o == 0xfa8 || o == 0xfb0 ||
+        if (o == 0xfa0 || o == 0xfa4 || o == 0xfa8 || o == 0xfb0 || o == 0xfb4 ||
+            o == 0xfb8 || o == 0xfbc ||
             o == 0xfd0 || o == 0xfd4 || o == 0xfd8 || o == 0xfdc ||
             o == 0xfe0 || o == 0xfe4 || o == 0xfe8 || o == 0xfec ||
             o == 0xff0 || o == 0xff4 || o == 0xff8 || o == 0xffc) {
@@ -1961,6 +1962,15 @@ synthetic_tx_done:
                 break;
             case 0xfb0:
                 trace_name = "send_chunk_ret";
+                break;
+            case 0xfb4:
+                trace_name = "url_handler";
+                break;
+            case 0xfb8:
+                trace_name = "body_send_len";
+                break;
+            case 0xfbc:
+                trace_name = "body_send_ret";
                 break;
             case 0xfa8:
                 trace_name = "dir_lookup_ret";
