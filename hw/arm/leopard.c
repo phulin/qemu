@@ -751,6 +751,25 @@ static void leopard_pc_sample_cb(void *opaque)
                     leopard_pc_sample_n, pc, lr, sp);
         }
         leopard_pc_sample_n++;
+        /* Capture the two strcmp args at FUN_403FC47C's final compare.
+         * pc=0x403FC508 is `bl 0x405074EC` (strcmp).
+         * r0 = first arg (= fp-0xcc = buf_d4+8 from sprintf_like(0xb))
+         * r1 = second arg (= buf_60+0x21 or buf_a8 from sprintf_like(100/1))
+         * Knowing the strings tells us if any request shape can match. */
+        if (pc == 0x403FC508) {
+            static int hits;
+            if (hits < 5) {
+                hits++;
+                uint32_t r0v = acpu->env.regs[0];
+                uint32_t r1v = acpu->env.regs[1];
+                char a[80] = {0}, b[80] = {0};
+                if (r0v) cpu_physical_memory_read(r0v, a, sizeof(a)-1);
+                if (r1v) cpu_physical_memory_read(r1v, b, sizeof(b)-1);
+                fprintf(stderr,
+                  "[fc47c-strcmp] r0=%#x \"%s\" r1=%#x \"%s\"\n",
+                  r0v, a, r1v, b);
+            }
+        }
         /* Track the high-water-mark PC inside wlan_start's body
          * (0x403C87C0..0x403C8AB0). Tells us how far wlan's start
          * handler progresses before the lifecycle stalls there.
@@ -2075,6 +2094,7 @@ synthetic_tx_done:
         }
         if (o == 0xfa0 || o == 0xfa4 || o == 0xfa8 || o == 0xfb0 || o == 0xfb4 ||
             o == 0xfb8 || o == 0xfbc || o == 0xfc0 || o == 0xfc4 ||
+            o == 0xfc8 || o == 0xfcc ||
             o == 0xfd0 || o == 0xfd4 || o == 0xfd8 || o == 0xfdc ||
             o == 0xfe0 || o == 0xfe4 || o == 0xfe8 || o == 0xfec ||
             o == 0xff0 || o == 0xff4 || o == 0xff8 || o == 0xffc) {
@@ -2116,6 +2136,45 @@ synthetic_tx_done:
             case 0xfc0:
                 trace_name = "appstart_handler";
                 break;
+            case 0xfc8: {
+                /* string-pointer channel (raw, like 0xfc4 but no name). */
+                char buf[80] = {0};
+                if (val >= 0x40000000 && val < 0x42000000) {
+                    address_space_read(&address_space_memory,
+                                       (hwaddr)val,
+                                       MEMTXATTRS_UNSPECIFIED,
+                                       buf, sizeof(buf) - 1);
+                    for (int i = 0; i < (int)sizeof(buf); i++) {
+                        if ((unsigned char)buf[i] < 0x20 || buf[i] == 0x7f) {
+                            buf[i] = 0;
+                            break;
+                        }
+                    }
+                }
+                fprintf(stderr, "[fe-trace] str_arg0 = %#x \"%s\"\n",
+                        (unsigned)val, buf);
+                trace_name = NULL;
+                break;
+            }
+            case 0xfcc: {
+                char buf[80] = {0};
+                if (val >= 0x40000000 && val < 0x42000000) {
+                    address_space_read(&address_space_memory,
+                                       (hwaddr)val,
+                                       MEMTXATTRS_UNSPECIFIED,
+                                       buf, sizeof(buf) - 1);
+                    for (int i = 0; i < (int)sizeof(buf); i++) {
+                        if ((unsigned char)buf[i] < 0x20 || buf[i] == 0x7f) {
+                            buf[i] = 0;
+                            break;
+                        }
+                    }
+                }
+                fprintf(stderr, "[fe-trace] str_arg1 = %#x \"%s\"\n",
+                        (unsigned)val, buf);
+                trace_name = NULL;
+                break;
+            }
             case 0xfc4: {
                 /* Name pointer: read the string from guest DRAM and log it. */
                 char namebuf[24] = {0};
