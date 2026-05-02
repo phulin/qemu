@@ -1933,7 +1933,7 @@ synthetic_tx_done:
             }
         }
         if (o == 0xfa0 || o == 0xfa4 || o == 0xfa8 || o == 0xfb0 || o == 0xfb4 ||
-            o == 0xfb8 || o == 0xfbc ||
+            o == 0xfb8 || o == 0xfbc || o == 0xfc0 || o == 0xfc4 ||
             o == 0xfd0 || o == 0xfd4 || o == 0xfd8 || o == 0xfdc ||
             o == 0xfe0 || o == 0xfe4 || o == 0xfe8 || o == 0xfec ||
             o == 0xff0 || o == 0xff4 || o == 0xff8 || o == 0xffc) {
@@ -1972,6 +1972,29 @@ synthetic_tx_done:
             case 0xfbc:
                 trace_name = "body_send_ret";
                 break;
+            case 0xfc0:
+                trace_name = "appstart_handler";
+                break;
+            case 0xfc4: {
+                /* Name pointer: read the string from guest DRAM and log it. */
+                char namebuf[24] = {0};
+                if (val >= 0x40000000 && val < 0x42000000) {
+                    address_space_read(&address_space_memory,
+                                       (hwaddr)val,
+                                       MEMTXATTRS_UNSPECIFIED,
+                                       namebuf, sizeof(namebuf) - 1);
+                    for (int i = 0; i < (int)sizeof(namebuf); i++) {
+                        if ((unsigned char)namebuf[i] < 0x20 || namebuf[i] == 0x7f) {
+                            namebuf[i] = 0;
+                            break;
+                        }
+                    }
+                }
+                fprintf(stderr, "[fe-trace] appstart_name = %#x \"%s\"\n",
+                        (unsigned)val, namebuf);
+                trace_name = NULL; /* skip the generic fprintf below */
+                break;
+            }
             case 0xfa8:
                 trace_name = "dir_lookup_ret";
                 break;
@@ -2080,8 +2103,10 @@ synthetic_tx_done:
                 trace_name = "rx_proto_ret";
                 break;
             }
-            fprintf(stderr, "[fe-trace] %s = %#x  (pc=%#x lr=%#x)\n",
-                    trace_name, (unsigned)val, pc, lr);
+            if (trace_name) {
+                fprintf(stderr, "[fe-trace] %s = %#x  (pc=%#x lr=%#x)\n",
+                        trace_name, (unsigned)val, pc, lr);
+            }
         }
         /* Log distinct offsets once each. */
         static uint8_t seen[0x1000];
