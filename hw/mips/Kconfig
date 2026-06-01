@@ -13,6 +13,13 @@ config MALTA
     select SERIAL_MM
     select SMBUS_EEPROM
 
+config ARCHER_C7
+    bool
+    default y
+    depends on MIPS
+    select SERIAL_MM
+    select UNIMP
+
 config JAZZ
     bool
     default y
